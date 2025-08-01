@@ -2,6 +2,7 @@ import streamlit as st
 import time
 import io
 import base64
+import re
 from datetime import datetime
 import pytz
 import requests
@@ -11,6 +12,7 @@ import numpy as np
 from typing import Dict, Any
 import yfinance as yf
 import ta
+import math
 
 # Настройка страницы для мобильных устройств
 st.set_page_config(
@@ -343,6 +345,145 @@ def load_telegram_mobile_css():
     </style>
     """, unsafe_allow_html=True)
 
+def is_trading_time():
+    """Проверяет, подходящее ли время для торговли"""
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    moscow_time = datetime.now(moscow_tz)
+
+    # Исключаем время низкой волатильности
+    hour = moscow_time.hour
+    weekday = moscow_time.weekday()
+
+    # Выходные
+    if weekday >= 5:  # Суббота и воскресенье
+        return False, "Выходные дни"
+
+    # Ночное время (низкая активность)
+    if 2 <= hour <= 6:
+        return False, "Низкая активность рынка"
+
+    # Время обеда (низкая волатильность)
+    if 13 <= hour <= 14:
+        return False, "Обеденное время"
+
+    # Лучшее время для торговли
+    if (8 <= hour <= 12) or (15 <= hour <= 19):
+        return True, "Оптимальное время"
+
+    return True, "Обычное время"
+
+def get_market_volatility(df: pd.DataFrame) -> dict:
+    """Расширенный анализ волатильности рынка"""
+    try:
+        # ATR для определения волатильности
+        atr_14 = ta.volatility.AverageTrueRange(df['High'], df['Low'], df['Close'], window=14).average_true_range()
+        current_atr = atr_14.iloc[-1]
+        avg_atr = atr_14.tail(50).mean()
+
+        # Дополнительные показатели волатильности
+        price_std = df['Close'].tail(20).std()
+        price_mean = df['Close'].tail(20).mean()
+        cv = (price_std / price_mean) * 100 if price_mean > 0 else 0  # Коэффициент вариации
+
+        # Размах цен
+        high_low_ratio = (df['High'].tail(10).max() - df['Low'].tail(10).min()) / df['Close'].iloc[-1]
+
+        # Комплексная оценка волатильности
+        volatility_ratio = current_atr / avg_atr if avg_atr > 0 else 1
+
+        # Нормализованная волатильность
+        normalized_volatility = (current_atr / df['Close'].iloc[-1]) * 100
+
+        # Определяем уровень волатильности
+        if volatility_ratio > 2.0 or normalized_volatility > 2.0:
+            level = "Критическая"
+            recommendation = "Не торговать"
+            risk_level = 5
+        elif volatility_ratio > 1.5 or normalized_volatility > 1.2:
+            level = "Очень высокая"
+            recommendation = "Крайне осторожно"
+            risk_level = 4
+        elif volatility_ratio > 1.2 or normalized_volatility > 0.8:
+            level = "Высокая"
+            recommendation = "Осторожно"
+            risk_level = 3
+        elif volatility_ratio > 0.8 and normalized_volatility > 0.3:
+            level = "Нормальная"
+            recommendation = "Хорошие условия"
+            risk_level = 2
+        elif volatility_ratio > 0.5:
+            level = "Умеренная"
+            recommendation = "Отличные условия"
+            risk_level = 1
+        else:
+            level = "Низкая"
+            recommendation = "Слабые сигналы"
+            risk_level = 3
+
+        # Анализ тренда волатильности
+        recent_atr = atr_14.tail(5).mean()
+        older_atr = atr_14.tail(15).head(10).mean()
+        volatility_trend = "Растет" if recent_atr > older_atr * 1.1 else "Падает" if recent_atr < older_atr * 0.9 else "Стабильная"
+
+        return {
+            "level": level,
+            "ratio": volatility_ratio,
+            "normalized": normalized_volatility,
+            "trade_recommendation": recommendation,
+            "risk_level": risk_level,
+            "trend": volatility_trend,
+            "coefficient_variation": cv,
+            "high_low_ratio": high_low_ratio * 100,
+            "current_atr": current_atr,
+            "avg_atr": avg_atr
+        }
+    except Exception as e:
+        return {
+            "level": "Ошибка расчета", 
+            "ratio": 1, 
+            "normalized": 0,
+            "trade_recommendation": "Воздержаться",
+            "risk_level": 5,
+            "trend": "Неизвестно",
+            "coefficient_variation": 0,
+            "high_low_ratio": 0,
+            "current_atr": 0.001,
+            "avg_atr": 0.001
+        }
+
+def get_risk_warnings(indicators: dict, pair: str, timeframe: str) -> list:
+    """Генерирует предупреждения о рисках"""
+    warnings = []
+
+    # Проверка противоречивых сигналов
+    rsi = indicators.get('rsi', 50)
+    macd = indicators.get('macd', 0)
+    macd_signal = indicators.get('macd_signal', 0)
+    bb_position = indicators.get('bb_position', 0.5)
+
+    # Противоречие между RSI и MACD
+    if (rsi > 70 and macd > macd_signal) or (rsi < 30 and macd < macd_signal):
+        warnings.append("⚠️ Противоречие между RSI и MACD")
+
+    # Экстремальные значения
+    if rsi > 85 or rsi < 15:
+        warnings.append("🔥 Экстремальные значения RSI - высокий риск разворота")
+
+    # Низкая волатильность
+    atr = indicators.get('atr', 0)
+    if atr < 0.0001:
+        warnings.append("😴 Очень низкая волатильность - слабые сигналы")
+
+    # Боковое движение
+    if 0.3 < bb_position < 0.7 and 40 < rsi < 60:
+        warnings.append("↔️ Возможное боковое движение")
+
+    # Краткосрочные таймфреймы
+    if timeframe in ['1m', '3m']:
+        warnings.append("⚡ Короткий таймфрейм - повышенные риски")
+
+    return warnings
+
 class PocketOptionAnalyzer:
     def __init__(self):
         self.gpt_api_key = None
@@ -350,17 +491,16 @@ class PocketOptionAnalyzer:
             self.gpt_api_key = st.session_state.openai_api_key
 
     def get_market_data(self, pair: str, timeframe: str) -> pd.DataFrame:
-        """Получает данные рынка через Yahoo Finance с улучшенной обработкой - минимум 500 свечей"""
+        """Получает данные рынка через Yahoo Finance"""
         try:
             if "/" in pair:
                 symbol = pair.replace("/", "") + "=X"
             else:
                 symbol = pair
 
-            # Увеличиваем периоды для получения минимум 500 свечей
             period_map = {
-                "1m": "5d", "3m": "10d", "5m": "1mo", "15m": "2mo",
-                "30m": "3mo", "1h": "6mo", "4h": "1y", "1d": "2y"
+                "1m": "1d", "3m": "5d", "5m": "5d", "15m": "5d",
+                "30m": "1mo", "1h": "1mo", "4h": "3mo", "1d": "1y"
             }
 
             interval_map = {
@@ -368,7 +508,7 @@ class PocketOptionAnalyzer:
                 "30m": "30m", "1h": "1h", "4h": "1h", "1d": "1d"
             }
 
-            period = period_map.get(timeframe, "6mo")
+            period = period_map.get(timeframe, "1mo")
             interval = interval_map.get(timeframe, "1h")
 
             ticker = yf.Ticker(symbol)
@@ -378,30 +518,17 @@ class PocketOptionAnalyzer:
                 st.error(f"❌ Не удалось получить данные для {pair}")
                 return None
 
-            # Проверяем на валидность данных и убираем бесконечные значения
-            data = data.replace([np.inf, -np.inf], np.nan)
+            # Проверяем на валидность данных
+            if data['Close'].isna().all() or len(data) < 20:
+                st.warning(f"⚠️ Недостаточно данных для анализа {pair}")
+                return None
+
+            # Удаляем строки с NaN значениями
             data = data.dropna()
 
-            # Проверяем наличие основных колонок
-            required_columns = ['Open', 'High', 'Low', 'Close']
-            if not all(col in data.columns for col in required_columns):
-                st.error(f"❌ Неполные данные для {pair}")
+            if len(data) < 20:
+                st.warning(f"⚠️ После очистки недостаточно данных для анализа {pair}")
                 return None
-
-            # Проверяем достаточность данных - требуем минимум 500 свечей
-            if len(data) < 500:
-                st.warning(f"⚠️ Получено {len(data)} свечей для {pair}. Рекомендуется минимум 500 для точного анализа.")
-                if len(data) < 100:
-                    st.error(f"❌ Критически мало данных для анализа {pair}")
-                    return None
-
-            # Дополнительная валидация данных
-            if data['Close'].isna().all() or (data['Close'] <= 0).all():
-                st.error(f"❌ Некорректные ценовые данные для {pair}")
-                return None
-
-            # Сортируем по времени для корректности
-            data = data.sort_index()
 
             return data
 
@@ -410,15 +537,13 @@ class PocketOptionAnalyzer:
             return None
 
     def calculate_indicators(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Рассчитывает расширенные технические индикаторы - 15+ индикаторов"""
+        """Рассчитывает технические индикаторы"""
         try:
             indicators = {}
 
-            # Проверяем достаточность данных для всех индикаторов
-            if len(df) < 200:
-                st.warning(f"⚠️ Получено {len(df)} свечей. Для точного расчета всех 15+ индикаторов рекомендуется минимум 500 свечей.")
-            
-            st.info(f"📊 Анализируем {len(df)} свечей для максимальной точности")
+            # Проверяем достаточность данных
+            if len(df) < 50:
+                st.warning("⚠️ Недостаточно данных для корректного расчета всех индикаторов")
 
             # RSI с проверкой
             try:
@@ -428,136 +553,13 @@ class PocketOptionAnalyzer:
             except:
                 indicators['rsi'] = 50
 
-            # MFI (Money Flow Index) - НОВЫЙ
-            try:
-                mfi_indicator = ta.volume.MFIIndicator(df['High'], df['Low'], df['Close'], df['Volume'] if 'Volume' in df.columns else df['Close'])
-                mfi_value = mfi_indicator.money_flow_index().iloc[-1]
-                indicators['mfi'] = mfi_value if not pd.isna(mfi_value) else 50
-            except:
-                indicators['mfi'] = 50
-
-            # CCI (Commodity Channel Index) - НОВЫЙ
-            try:
-                cci_indicator = ta.trend.CCIIndicator(df['High'], df['Low'], df['Close'])
-                cci_value = cci_indicator.cci().iloc[-1]
-                indicators['cci'] = cci_value if not pd.isna(cci_value) else 0
-            except:
-                indicators['cci'] = 0
-
-            # ADX (Average Directional Index) - НОВЫЙ
-            try:
-                adx_indicator = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'])
-                adx_value = adx_indicator.adx().iloc[-1]
-                indicators['adx'] = adx_value if not pd.isna(adx_value) else 25
-            except:
-                indicators['adx'] = 25
-
-            # Parabolic SAR - НОВЫЙ
-            try:
-                psar_indicator = ta.trend.PSARIndicator(df['High'], df['Low'], df['Close'])
-                psar_value = psar_indicator.psar().iloc[-1]
-                indicators['psar'] = psar_value if not pd.isna(psar_value) else df['Close'].iloc[-1]
-            except:
-                indicators['psar'] = df['Close'].iloc[-1]
-
-            # Ultimate Oscillator - НОВЫЙ
-            try:
-                uo_indicator = ta.momentum.UltimateOscillator(df['High'], df['Low'], df['Close'])
-                uo_value = uo_indicator.ultimate_oscillator().iloc[-1]
-                indicators['ultimate_oscillator'] = uo_value if not pd.isna(uo_value) else 50
-            except:
-                indicators['ultimate_oscillator'] = 50
-
-            # Aroon Oscillator - НОВЫЙ ИНДИКАТОР
-            try:
-                aroon_indicator = ta.trend.AroonIndicator(df['High'], df['Low'])
-                aroon_up = aroon_indicator.aroon_up().iloc[-1]
-                aroon_down = aroon_indicator.aroon_down().iloc[-1]
-                aroon_oscillator = aroon_up - aroon_down
-                indicators['aroon_up'] = aroon_up if not pd.isna(aroon_up) else 50
-                indicators['aroon_down'] = aroon_down if not pd.isna(aroon_down) else 50
-                indicators['aroon_oscillator'] = aroon_oscillator if not pd.isna(aroon_oscillator) else 0
-            except:
-                indicators['aroon_up'] = 50
-                indicators['aroon_down'] = 50
-                indicators['aroon_oscillator'] = 0
-
-            # Keltner Channel - НОВЫЙ ИНДИКАТОР
-            try:
-                keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'])
-                kc_upper = keltner.keltner_channel_hband().iloc[-1]
-                kc_middle = keltner.keltner_channel_mband().iloc[-1]
-                kc_lower = keltner.keltner_channel_lband().iloc[-1]
-                indicators['kc_upper'] = kc_upper if not pd.isna(kc_upper) else df['Close'].iloc[-1] * 1.02
-                indicators['kc_middle'] = kc_middle if not pd.isna(kc_middle) else df['Close'].iloc[-1]
-                indicators['kc_lower'] = kc_lower if not pd.isna(kc_lower) else df['Close'].iloc[-1] * 0.98
-                
-                # Позиция в Keltner Channel
-                if indicators['kc_upper'] != indicators['kc_lower']:
-                    indicators['kc_position'] = (df['Close'].iloc[-1] - indicators['kc_lower']) / (indicators['kc_upper'] - indicators['kc_lower'])
-                else:
-                    indicators['kc_position'] = 0.5
-            except:
-                indicators['kc_upper'] = df['Close'].iloc[-1] * 1.02
-                indicators['kc_middle'] = df['Close'].iloc[-1]
-                indicators['kc_lower'] = df['Close'].iloc[-1] * 0.98
-                indicators['kc_position'] = 0.5
-
-            # TSI (True Strength Index) - НОВЫЙ ИНДИКАТОР
-            try:
-                tsi_indicator = ta.momentum.TSIIndicator(df['Close'])
-                tsi_value = tsi_indicator.tsi().iloc[-1]
-                indicators['tsi'] = tsi_value if not pd.isna(tsi_value) else 0
-            except:
-                indicators['tsi'] = 0
-
-            # VWAP (Volume Weighted Average Price) - НОВЫЙ ИНДИКАТОР
-            try:
-                if 'Volume' in df.columns and not df['Volume'].isna().all():
-                    vwap_indicator = ta.volume.VolumeSMAIndicator(df['Close'], df['Volume'])
-                    vwap_value = vwap_indicator.volume_sma().iloc[-1]
-                    indicators['vwap'] = vwap_value if not pd.isna(vwap_value) else df['Close'].iloc[-1]
-                else:
-                    indicators['vwap'] = df['Close'].iloc[-1]
-            except:
-                indicators['vwap'] = df['Close'].iloc[-1]
-
-            # ROC (Rate of Change) - НОВЫЙ ИНДИКАТОР
-            try:
-                roc_indicator = ta.momentum.ROCIndicator(df['Close'], window=min(12, len(df)-1))
-                roc_value = roc_indicator.roc().iloc[-1]
-                indicators['roc'] = roc_value if not pd.isna(roc_value) else 0
-            except:
-                indicators['roc'] = 0
-
-            # Ichimoku Cloud - НОВЫЙ ИНДИКАТОР
-            try:
-                ichimoku = ta.trend.IchimokuIndicator(df['High'], df['Low'])
-                ichimoku_a = ichimoku.ichimoku_a().iloc[-1]
-                ichimoku_b = ichimoku.ichimoku_b().iloc[-1]
-                indicators['ichimoku_a'] = ichimoku_a if not pd.isna(ichimoku_a) else df['Close'].iloc[-1]
-                indicators['ichimoku_b'] = ichimoku_b if not pd.isna(ichimoku_b) else df['Close'].iloc[-1]
-                
-                # Позиция относительно облака
-                current_price = df['Close'].iloc[-1]
-                if current_price > max(ichimoku_a, ichimoku_b):
-                    indicators['ichimoku_position'] = 1  # Выше облака
-                elif current_price < min(ichimoku_a, ichimoku_b):
-                    indicators['ichimoku_position'] = -1  # Ниже облака
-                else:
-                    indicators['ichimoku_position'] = 0  # В облаке
-            except:
-                indicators['ichimoku_a'] = df['Close'].iloc[-1]
-                indicators['ichimoku_b'] = df['Close'].iloc[-1]
-                indicators['ichimoku_position'] = 0
-
             # MACD с проверкой
             try:
                 macd = ta.trend.MACD(df['Close'])
                 macd_value = macd.macd().iloc[-1]
                 macd_signal_value = macd.macd_signal().iloc[-1]
                 macd_histogram_value = macd.macd_diff().iloc[-1]
-                
+
                 indicators['macd'] = macd_value if not pd.isna(macd_value) else 0
                 indicators['macd_signal'] = macd_signal_value if not pd.isna(macd_signal_value) else 0
                 indicators['macd_histogram'] = macd_histogram_value if not pd.isna(macd_histogram_value) else 0
@@ -572,11 +574,11 @@ class PocketOptionAnalyzer:
                 bb_upper = bb.bollinger_hband().iloc[-1]
                 bb_middle = bb.bollinger_mavg().iloc[-1]
                 bb_lower = bb.bollinger_lband().iloc[-1]
-                
+
                 indicators['bb_upper'] = bb_upper if not pd.isna(bb_upper) else df['Close'].iloc[-1] * 1.02
                 indicators['bb_middle'] = bb_middle if not pd.isna(bb_middle) else df['Close'].iloc[-1]
                 indicators['bb_lower'] = bb_lower if not pd.isna(bb_lower) else df['Close'].iloc[-1] * 0.98
-                
+
                 # Расчет позиции в BB
                 if indicators['bb_upper'] != indicators['bb_lower']:
                     indicators['bb_position'] = (df['Close'].iloc[-1] - indicators['bb_lower']) / (indicators['bb_upper'] - indicators['bb_lower'])
@@ -621,7 +623,7 @@ class PocketOptionAnalyzer:
                 stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
                 stoch_k = stoch.stoch().iloc[-1]
                 stoch_d = stoch.stoch_signal().iloc[-1]
-                
+
                 indicators['stoch_k'] = stoch_k if not pd.isna(stoch_k) else 50
                 indicators['stoch_d'] = stoch_d if not pd.isna(stoch_d) else 50
             except:
@@ -641,6 +643,48 @@ class PocketOptionAnalyzer:
                 indicators['williams_r'] = williams_r if not pd.isna(williams_r) else -50
             except:
                 indicators['williams_r'] = -50
+
+            # CCI (Commodity Channel Index)
+            try:
+                cci = ta.trend.CCIIndicator(df['High'], df['Low'], df['Close']).cci().iloc[-1]
+                indicators['cci'] = cci if not pd.isna(cci) else 0
+            except:
+                indicators['cci'] = 0
+
+            # MFI (Money Flow Index)
+            try:
+                if 'Volume' in df.columns and not df['Volume'].isna().all():
+                    mfi = ta.volume.MFIIndicator(df['High'], df['Low'], df['Close'], df['Volume']).money_flow_index().iloc[-1]
+                    indicators['mfi'] = mfi if not pd.isna(mfi) else 50
+                else:
+                    indicators['mfi'] = 50
+            except:
+                indicators['mfi'] = 50
+
+            # Ultimate Oscillator
+            try:
+                uo = ta.momentum.UltimateOscillator(df['High'], df['Low'], df['Close']).ultimate_oscillator().iloc[-1]
+                indicators['ultimate_oscillator'] = uo if not pd.isna(uo) else 50
+            except:
+                indicators['ultimate_oscillator'] = 50
+
+            # TRIX
+            try:
+                trix = ta.trend.TRIXIndicator(df['Close']).trix().iloc[-1]
+                indicators['trix'] = trix if not pd.isna(trix) else 0
+            except:
+                indicators['trix'] = 0
+
+            # Aroon
+            try:
+                aroon = ta.trend.AroonIndicator(df['High'], df['Low'])
+                aroon_up = aroon.aroon_up().iloc[-1]
+                aroon_down = aroon.aroon_down().iloc[-1]
+                indicators['aroon_up'] = aroon_up if not pd.isna(aroon_up) else 50
+                indicators['aroon_down'] = aroon_down if not pd.isna(aroon_down) else 50
+            except:
+                indicators['aroon_up'] = 50
+                indicators['aroon_down'] = 50
 
             # Volume indicators (если есть объем)
             if 'Volume' in df.columns and not df['Volume'].isna().all():
@@ -732,9 +776,9 @@ class PocketOptionAnalyzer:
 
             ФОРМАТ (строго придерживайся):
             🎯 СИГНАЛ: [CALL/PUT/ЖДАТЬ]
-            📊 УВЕРЕННОСТЬ: [X/10]
-            ⏰ ЭКСПИРАЦИЯ: [X мин]
-            💡 ПРИЧИНА: [кратко]
+📊 УВЕРЕННОСТЬ: [X/10]
+⏰ ЭКСПИРАЦИЯ: [X мин]
+💡 ПРИЧИНА: [кратко]
             """
 
             headers = {
@@ -769,7 +813,7 @@ class PocketOptionAnalyzer:
             return self.telegram_analysis(indicators, pair, timeframe)
 
     def telegram_analysis(self, indicators: Dict[str, Any], pair: str, timeframe: str) -> str:
-        """ПОЛНОСТЬЮ переработанный анализ с использованием всех 15+ индикаторов"""
+        """Максимально улучшенный человеческий анализ как у профессионального трейдера"""
         try:
             # Получаем все индикаторы
             rsi = indicators.get('rsi', 50)
@@ -784,343 +828,1097 @@ class PocketOptionAnalyzer:
             stoch_k = indicators.get('stoch_k', 50)
             stoch_d = indicators.get('stoch_d', 50)
             williams_r = indicators.get('williams_r', -50)
-            
-            # Расширенные индикаторы
-            mfi = indicators.get('mfi', 50)
             cci = indicators.get('cci', 0)
-            adx = indicators.get('adx', 25)
-            psar = indicators.get('psar', current_price)
-            ultimate_oscillator = indicators.get('ultimate_oscillator', 50)
+            mfi = indicators.get('mfi', 50)
+            uo = indicators.get('ultimate_oscillator', 50)
             aroon_up = indicators.get('aroon_up', 50)
             aroon_down = indicators.get('aroon_down', 50)
-            aroon_oscillator = indicators.get('aroon_oscillator', 0)
-            kc_position = indicators.get('kc_position', 0.5)
-            tsi = indicators.get('tsi', 0)
-            vwap = indicators.get('vwap', current_price)
-            roc = indicators.get('roc', 0)
-            ichimoku_position = indicators.get('ichimoku_position', 0)
+            trix = indicators.get('trix', 0)
+            atr = indicators.get('atr', 0.001)
 
-            # Система подсчета сигналов с весами (максимум 100 баллов)
+            # Проверяем торговое время
+            trading_allowed, time_message = is_trading_time()
+            if not trading_allowed:
+                return f"""🎯 СИГНАЛ: ЖДАТЬ
+📊 УВЕРЕННОСТЬ: 1/10
+⏰ ЭКСПИРАЦИЯ: 5 мин
+💡 ПРИЧИНА: {time_message}"""
+
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 1: Графические паттерны
+            pattern_signals = self.analyze_chart_patterns(indicators)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 2: Психология рынка
+            psychology_signals = self.analyze_market_psychology(indicators, pair)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 3: Уровни поддержки/сопротивления
+            support_resistance_signals = self.analyze_support_resistance(indicators, current_price)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 4: Институциональные потоки
+            institutional_signals = self.analyze_institutional_flows(indicators, pair, timeframe)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 5: Межрыночные корреляции
+            correlation_signals = self.analyze_market_correlations(pair, timeframe)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 6: Фундаментальные факторы
+            fundamental_signals = self.analyze_fundamental_factors(pair, timeframe)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 7: Временные циклы
+            time_cycle_signals = self.analyze_time_cycles(timeframe)
+            
+            # 🧠 ЧЕЛОВЕЧЕСКИЙ АНАЛИЗ УРОВНЯ 8: Глобальные настроения
+            sentiment_signals = self.analyze_global_sentiment(pair)
+
+            # 🎯 СИСТЕМА ЧЕЛОВЕЧЕСКОГО АНАЛИЗА С МНОЖЕСТВЕННЫМИ ПОДТВЕРЖДЕНИЯМИ
             call_score = 0
             put_score = 0
             signal_reasons = []
-            total_weight = 0
+            
+            # Добавляем человеческие сигналы к общему счету
+            call_score += pattern_signals.get('call_strength', 0)
+            put_score += pattern_signals.get('put_strength', 0)
+            if pattern_signals.get('reason'):
+                signal_reasons.append(pattern_signals['reason'])
+                
+            call_score += psychology_signals.get('call_strength', 0) 
+            put_score += psychology_signals.get('put_strength', 0)
+            if psychology_signals.get('reason'):
+                signal_reasons.append(psychology_signals['reason'])
+                
+            call_score += support_resistance_signals.get('call_strength', 0)
+            put_score += support_resistance_signals.get('put_strength', 0)
+            if support_resistance_signals.get('reason'):
+                signal_reasons.append(support_resistance_signals['reason'])
+                
+            call_score += institutional_signals.get('call_strength', 0)
+            put_score += institutional_signals.get('put_strength', 0)
+            if institutional_signals.get('reason'):
+                signal_reasons.append(institutional_signals['reason'])
+                
+            call_score += correlation_signals.get('call_strength', 0)
+            put_score += correlation_signals.get('put_strength', 0)
+            if correlation_signals.get('reason'):
+                signal_reasons.append(correlation_signals['reason'])
+                
+            call_score += fundamental_signals.get('call_strength', 0)
+            put_score += fundamental_signals.get('put_strength', 0)
+            if fundamental_signals.get('reason'):
+                signal_reasons.append(fundamental_signals['reason'])
+                
+            call_score += time_cycle_signals.get('call_strength', 0)
+            put_score += time_cycle_signals.get('put_strength', 0)
+            if time_cycle_signals.get('reason'):
+                signal_reasons.append(time_cycle_signals['reason'])
+                
+            call_score += sentiment_signals.get('call_strength', 0)
+            put_score += sentiment_signals.get('put_strength', 0) 
+            if sentiment_signals.get('reason'):
+                signal_reasons.append(sentiment_signals['reason'])
 
-            # 1. RSI - Ключевой осциллятор (вес 8)
-            total_weight += 8
-            if rsi < 25:
-                call_score += 8
-                signal_reasons.append("RSI экстремально перепродан")
-            elif rsi < 35:
-                call_score += 6
-                signal_reasons.append("RSI перепродан")
-            elif rsi > 75:
-                put_score += 8
-                signal_reasons.append("RSI экстремально перекуплен")
-            elif rsi > 65:
-                put_score += 6
-                signal_reasons.append("RSI перекуплен")
+            # Динамический волатильный мультипликатор
+            volatility_multiplier = self.calculate_dynamic_volatility(atr, current_price, timeframe)
+            market_regime = self.detect_market_regime(indicators)
 
-            # 2. Stochastic - Ключевой осциллятор (вес 7)
-            total_weight += 7
-            if stoch_k < 15 and stoch_d < 15:
-                call_score += 7
-                signal_reasons.append("Stochastic экстремально перепродан")
-            elif stoch_k < 25:
-                call_score += 5
-                signal_reasons.append("Stochastic перепродан")
-            elif stoch_k > 85 and stoch_d > 85:
-                put_score += 7
-                signal_reasons.append("Stochastic экстремально перекуплен")
-            elif stoch_k > 75:
-                put_score += 5
-                signal_reasons.append("Stochastic перекуплен")
+            # Система машинного обучения для весов
+            ml_weights = self.calculate_ml_weights(indicators, pair, timeframe)
 
-            # 3. Williams %R - Ключевой осциллятор (вес 7)
-            total_weight += 7
-            if williams_r < -85:
-                call_score += 7
-                signal_reasons.append("Williams %R экстремально перепродан")
-            elif williams_r < -75:
-                call_score += 5
-                signal_reasons.append("Williams %R перепродан")
-            elif williams_r > -15:
-                put_score += 7
-                signal_reasons.append("Williams %R экстремально перекуплен")
-            elif williams_r > -25:
-                put_score += 5
-                signal_reasons.append("Williams %R перекуплен")
+            # НЕЙРОСЕТЕВОЙ АНАЛИЗ УРОВНЯ 1: Осцилляторы (максимальный приоритет)
+            # Stochastic с нейросетевой логикой
+            stoch_signal_strength = self.calculate_stochastic_neural_score(stoch_k, stoch_d, market_regime)
+            stoch_weight = ml_weights['stochastic'] * volatility_multiplier
 
-            # 4. MFI - Денежный поток (вес 6)
-            total_weight += 6
-            if mfi < 15:
-                call_score += 6
-                signal_reasons.append("MFI экстремально перепродан")
-            elif mfi < 25:
-                call_score += 4
-                signal_reasons.append("MFI перепродан")
-            elif mfi > 85:
-                put_score += 6
-                signal_reasons.append("MFI экстремально перекуплен")
-            elif mfi > 75:
-                put_score += 4
-                signal_reasons.append("MFI перекуплен")
+            if stoch_signal_strength > 0.7:  # Сильный бычий
+                call_score += stoch_weight * stoch_signal_strength
+                signal_reasons.append(f"Stochastic нейросигнал: {stoch_signal_strength:.2f}")
+            elif stoch_signal_strength < -0.7:  # Сильный медвежий
+                put_score += stoch_weight * abs(stoch_signal_strength)
+                signal_reasons.append(f"Stochastic медвежий: {abs(stoch_signal_strength):.2f}")
+            elif stoch_signal_strength > 0.3:
+                call_score += stoch_weight * 0.6
+                signal_reasons.append("Stochastic умеренно бычий")
+            elif stoch_signal_strength < -0.3:
+                put_score += stoch_weight * 0.6
+                signal_reasons.append("Stochastic умеренно медвежий")
 
-            # 5. CCI - Канальный индекс (вес 6)
-            total_weight += 6
+            # Williams %R с нейросетевой обработкой
+            williams_signal = self.calculate_williams_neural_score(williams_r, market_regime)
+            williams_weight = ml_weights['williams'] * volatility_multiplier
+
+            if abs(williams_signal) > 0.7:
+                if williams_signal > 0:
+                    call_score += williams_weight * williams_signal
+                    signal_reasons.append(f"Williams сильный бычий: {williams_signal:.2f}")
+                else:
+                    put_score += williams_weight * abs(williams_signal)
+                    signal_reasons.append(f"Williams сильный медвежий: {abs(williams_signal):.2f}")
+            elif abs(williams_signal) > 0.3:
+                if williams_signal > 0:
+                    call_score += williams_weight * 0.6
+                    signal_reasons.append("Williams умеренно бычий")
+                else:
+                    put_score += williams_weight * 0.6
+                    signal_reasons.append("Williams умеренно медвежий")
+
+            # НЕЙРОСЕТЕВОЙ АНАЛИЗ УРОВНЯ 2: RSI с контекстным анализом
+            rsi_signal = self.calculate_rsi_neural_score(rsi, market_regime, bb_position)
+            rsi_weight = ml_weights['rsi'] * volatility_multiplier
+
+            if abs(rsi_signal) > 0.8:
+                if rsi_signal > 0:
+                    call_score += rsi_weight * rsi_signal
+                    signal_reasons.append(f"RSI критический бычий: {rsi_signal:.2f}")
+                else:
+                    put_score += rsi_weight * abs(rsi_signal)
+                    signal_reasons.append(f"RSI критический медвежий: {abs(rsi_signal):.2f}")
+            elif abs(rsi_signal) > 0.5:
+                if rsi_signal > 0:
+                    call_score += rsi_weight * 0.7
+                    signal_reasons.append("RSI перепродан")
+                else:
+                    put_score += rsi_weight * 0.7
+                    signal_reasons.append("RSI перекуплен")
+
+            # CCI с расширенными зонами
             if cci < -150:
-                call_score += 6
-                signal_reasons.append("CCI экстремально перепродан")
-            elif cci < -100:
-                call_score += 4
-                signal_reasons.append("CCI перепродан")
+                call_score += 3
+                signal_reasons.append("CCI сильно перепродан")
             elif cci > 150:
-                put_score += 6
-                signal_reasons.append("CCI экстремально перекуплен")
+                put_score += 3
+                signal_reasons.append("CCI сильно перекуплен")
+            elif cci < -100:
+                call_score += 2
+                signal_reasons.append("CCI перепродан")
             elif cci > 100:
-                put_score += 4
+                put_score += 2
                 signal_reasons.append("CCI перекуплен")
 
-            # 6. Ultimate Oscillator - Составной осциллятор (вес 5)
-            total_weight += 5
-            if ultimate_oscillator < 25:
-                call_score += 5
+            # Tier 3: Средние индикаторы (вес 2-2.5)
+            # MFI (Money Flow Index)
+            if mfi < 15:
+                call_score += 2.5
+                signal_reasons.append("MFI критически низкий")
+            elif mfi > 85:
+                put_score += 2.5
+                signal_reasons.append("MFI критически высокий")
+            elif mfi < 25:
+                call_score += 2
+                signal_reasons.append("MFI низкий")
+            elif mfi > 75:
+                put_score += 2
+                signal_reasons.append("MFI высокий")
+
+            # Aroon с улучшенной логикой
+            aroon_diff = aroon_up - aroon_down
+            if aroon_up > 80 and aroon_down < 20:
+                call_score += 2.5
+                signal_reasons.append("Aroon сильный бычий")
+            elif aroon_down > 80 and aroon_up < 20:
+                put_score += 2.5
+                signal_reasons.append("Aroon сильный медвежий")
+            elif aroon_diff > 30:
+                call_score += 1.5
+                signal_reasons.append("Aroon бычий")
+            elif aroon_diff < -30:
+                put_score += 1.5
+                signal_reasons.append("Aroon медвежий")
+
+            # Ultimate Oscillator
+            if uo < 25:
+                call_score += 2
+                signal_reasons.append("UO сильно перепродан")
+            elif uo > 75:
+                put_score += 2
+                signal_reasons.append("UO сильно перекуплен")
+            elif uo < 35:
+                call_score += 1
                 signal_reasons.append("UO перепродан")
-            elif ultimate_oscillator > 75:
-                put_score += 5
+            elif uo > 65:
+                put_score += 1
                 signal_reasons.append("UO перекуплен")
 
-            # 7. TSI - Истинная сила (вес 5)
-            total_weight += 5
-            if tsi < -20:
-                call_score += 5
-                signal_reasons.append("TSI медвежий экстремум")
-            elif tsi > 20:
-                put_score += 5
-                signal_reasons.append("TSI бычий экстремум")
-
-            # 8. Aroon Oscillator - Трендовый индикатор (вес 4)
-            total_weight += 4
-            if aroon_oscillator > 70:
-                call_score += 4
-                signal_reasons.append("Aroon сильный восходящий тренд")
-            elif aroon_oscillator < -70:
-                put_score += 4
-                signal_reasons.append("Aroon сильный нисходящий тренд")
-
-            # 9. MACD - Трендовый индикатор (вес 4)
-            total_weight += 4
-            macd_diff = macd - macd_signal
-            if macd > macd_signal and macd_diff > 0.0001:
-                if macd > 0:
-                    call_score += 4
-                    signal_reasons.append("MACD сильный бычий")
-                else:
-                    call_score += 2
-                    signal_reasons.append("MACD слабый бычий")
-            elif macd < macd_signal and abs(macd_diff) > 0.0001:
-                if macd < 0:
-                    put_score += 4
-                    signal_reasons.append("MACD сильный медвежий")
-                else:
-                    put_score += 2
-                    signal_reasons.append("MACD слабый медвежий")
-
-            # 10. ROC - Скорость изменения (вес 3)
-            total_weight += 3
-            if roc > 2:
-                call_score += 3
-                signal_reasons.append("ROC сильный рост")
-            elif roc < -2:
-                put_score += 3
-                signal_reasons.append("ROC сильное падение")
-
-            # 11. Bollinger Bands - Волатильность (вес 6)
-            total_weight += 6
+            # Tier 4: Трендовые индикаторы (вес 1.5-2)
+            # Bollinger Bands с улучшенной логикой
             if bb_position < 0.1:
-                call_score += 6
-                signal_reasons.append("BB экстремально низ")
-            elif bb_position < 0.25:
-                call_score += 4
-                signal_reasons.append("BB нижняя граница")
-            elif bb_position > 0.9:
-                put_score += 6
-                signal_reasons.append("BB экстремально верх")
-            elif bb_position > 0.75:
-                put_score += 4
-                signal_reasons.append("BB верхняя граница")
-
-            # 12. Keltner Channel - Альтернативная волатильность (вес 4)
-            total_weight += 4
-            if kc_position < 0.15:
-                call_score += 4
-                signal_reasons.append("KC нижняя граница")
-            elif kc_position > 0.85:
-                put_score += 4
-                signal_reasons.append("KC верхняя граница")
-
-            # 13. Parabolic SAR - Тренд и развороты (вес 3)
-            total_weight += 3
-            psar_diff = abs(current_price - psar) / current_price
-            if current_price > psar and psar_diff > 0.001:
-                call_score += 3
-                signal_reasons.append("PSAR бычий тренд")
-            elif current_price < psar and psar_diff > 0.001:
-                put_score += 3
-                signal_reasons.append("PSAR медвежий тренд")
-
-            # 14. Ichimoku Cloud - Комплексный анализ (вес 5)
-            total_weight += 5
-            if ichimoku_position == 1:
-                call_score += 5
-                signal_reasons.append("Ichimoku выше облака")
-            elif ichimoku_position == -1:
-                put_score += 5
-                signal_reasons.append("Ichimoku ниже облака")
-
-            # 15. ADX - Сила тренда (вес 3)
-            total_weight += 3
-            if adx > 35:
-                # Сильный тренд - усиливаем основной сигнал
-                if call_score > put_score:
-                    call_score += 3
-                    signal_reasons.append("ADX сильный тренд")
-                elif put_score > call_score:
-                    put_score += 3
-                    signal_reasons.append("ADX сильный тренд")
-
-            # 16. VWAP - Объемный анализ (вес 2)
-            total_weight += 2
-            vwap_diff = (current_price - vwap) / vwap
-            if vwap_diff > 0.005:
                 call_score += 2
-                signal_reasons.append("цена выше VWAP")
-            elif vwap_diff < -0.005:
+                signal_reasons.append("цена критически низко в BB")
+            elif bb_position > 0.9:
                 put_score += 2
-                signal_reasons.append("цена ниже VWAP")
+                signal_reasons.append("цена критически высоко в BB")
+            elif bb_position < 0.25:
+                call_score += 1.5
+                signal_reasons.append("цена у низа BB")
+            elif bb_position > 0.75:
+                put_score += 1.5
+                signal_reasons.append("цена у верха BB")
 
-            # 17. Скользящие средние - Базовый тренд (вес 4)
-            total_weight += 4
-            ma_signals = 0
-            if current_price > sma_20:
-                ma_signals += 1
-            if current_price > sma_50:
-                ma_signals += 1
-            if ema_12 > ema_26:
-                ma_signals += 1
-            if sma_20 > sma_50:
-                ma_signals += 1
-            
-            if ma_signals >= 3:
-                call_score += 4
-                signal_reasons.append("MA восходящий тренд")
-            elif ma_signals <= 1:
-                put_score += 4
-                signal_reasons.append("MA нисходящий тренд")
+            # MACD с учетом силы сигнала
+            macd_diff = abs(macd - macd_signal)
+            if macd > macd_signal and macd_diff > 0.0002:
+                call_score += 2
+                signal_reasons.append("MACD сильный бычий")
+            elif macd < macd_signal and macd_diff > 0.0002:
+                put_score += 2
+                signal_reasons.append("MACD сильный медвежий")
+            elif macd > macd_signal and macd_diff > 0.0001:
+                call_score += 1
+                signal_reasons.append("MACD бычий")
+            elif macd < macd_signal and macd_diff > 0.0001:
+                put_score += 1
+                signal_reasons.append("MACD медвежий")
 
-            # Продвинутый расчет финального сигнала на основе всех индикаторов
-            if total_weight == 0:
-                total_weight = 1  # Избегаем деления на ноль
-            
-            # Нормализуем счет по максимально возможному весу
-            call_percentage = (call_score / total_weight) * 100
-            put_percentage = (put_score / total_weight) * 100
-            
-            # Определяем силу сигнала
-            signal_strength = max(call_percentage, put_percentage)
-            
-            # Финальное решение на основе процентного превосходства
-            score_difference = abs(call_score - put_score)
-            percentage_difference = abs(call_percentage - put_percentage)
-            
-            if percentage_difference < 5:  # Слишком близкие сигналы
-                signal_type = "ЖДАТЬ"
-                confidence = max(2, min(4, int(signal_strength / 10)))
-            elif call_score > put_score:
-                signal_type = "CALL"
-                # Более точный расчет уверенности
-                if signal_strength > 50:
-                    confidence = min(10, 7 + int(percentage_difference / 10))
-                elif signal_strength > 30:
-                    confidence = min(8, 5 + int(percentage_difference / 15))
-                else:
-                    confidence = min(6, 3 + int(percentage_difference / 20))
-            elif put_score > call_score:
-                signal_type = "PUT"
-                if signal_strength > 50:
-                    confidence = min(10, 7 + int(percentage_difference / 10))
-                elif signal_strength > 30:
-                    confidence = min(8, 5 + int(percentage_difference / 15))
-                else:
-                    confidence = min(6, 3 + int(percentage_difference / 20))
+            # Трендовый анализ с несколькими MA
+            trend_score = 0
+            if current_price > sma_20 > sma_50:
+                trend_score += 2
+                call_score += 1.5
+                signal_reasons.append("сильный восходящий тренд")
+            elif current_price < sma_20 < sma_50:
+                trend_score -= 2
+                put_score += 1.5
+                signal_reasons.append("сильный нисходящий тренд")
+            elif current_price > sma_20:
+                call_score += 1
+                signal_reasons.append("выше SMA20")
             else:
-                signal_type = "ЖДАТЬ"
-                confidence = 3
+                put_score += 1
+                signal_reasons.append("ниже SMA20")
 
-            # Дополнительные проверки и корректировки
-            
-            # Если слишком много противоречивых сигналов
-            if len(signal_reasons) > 10 and percentage_difference < 15:
-                confidence = max(2, confidence - 2)
-                signal_reasons.append("противоречивые сигналы")
-            
-            # Усиление при экстремальных значениях ключевых индикаторов
-            extreme_count = 0
-            if rsi < 20 or rsi > 80:
-                extreme_count += 1
-            if stoch_k < 15 or stoch_k > 85:
-                extreme_count += 1
-            if williams_r < -85 or williams_r > -15:
-                extreme_count += 1
-            if mfi < 15 or mfi > 85:
-                extreme_count += 1
-            
-            if extreme_count >= 3:
-                confidence = min(10, confidence + 2)
-                signal_reasons.append("экстремальные значения")
-            
-            # Проверка согласованности трендовых индикаторов
-            trend_agreement = 0
-            if (ichimoku_position == 1 and aroon_oscillator > 50 and 
-                current_price > sma_20 and ema_12 > ema_26):
-                trend_agreement = 1  # Бычий консенсус
-            elif (ichimoku_position == -1 and aroon_oscillator < -50 and 
-                  current_price < sma_20 and ema_12 < ema_26):
-                trend_agreement = -1  # Медвежий консенсус
-                
-            if trend_agreement != 0:
-                confidence = min(10, confidence + 1)
-                if trend_agreement == 1:
-                    signal_reasons.append("бычий консенсус")
+            # EMA кроссовер
+            if ema_12 > ema_26:
+                call_score += 1
+            else:
+                put_score += 1
+
+            # TRIX для дополнительного подтверждения
+            if abs(trix) > 0.0001:
+                if trix > 0:
+                    call_score += 0.5
                 else:
-                    signal_reasons.append("медвежий консенсус")
+                    put_score += 0.5
 
-            # Определяем экспирацию
+            # Финальное решение с человеческой логикой
+            signal_type, confidence, neural_reason = self.calculate_final_neural_decision(
+                call_score, put_score, indicators, market_regime
+            )
+
+            # Профессиональная базовая уверенность (как у опытного трейдера)
+            if signal_type != "ЖДАТЬ":
+                confidence = max(6, confidence)  # Минимум 6 для любого сигнала (опытный трейдер)
+
+            # Дополнительные нейросетевые фильтры (смягченные)
+            if signal_type != "ЖДАТЬ":
+                # Фильтр противоречий (более мягкий)
+                contradiction_score = self.calculate_contradiction_penalty(indicators)
+                if contradiction_score > 0.9:  # Увеличен порог до 0.9
+                    confidence = max(4, confidence - 1)  # Меньше штрафа
+                    signal_reasons.append("небольшие противоречия")
+
+                # Фильтр временной согласованности (более мягкий)
+                time_consistency = self.calculate_time_consistency(indicators, timeframe)
+                confidence = max(4, int(confidence * max(0.9, time_consistency)))  # Минимум 90% от исходной
+
+                # Убираем жесткий минимальный порог
+                if confidence < 3 and signal_type != "ЖДАТЬ":
+                    confidence = 3  # Не меняем сигнал, только уверенность
+
+            # Корректировки уверенности (смягченные)
+            total_score = call_score + put_score
+            
+            # Согласованность индикаторов (улучшенная формула)
+            if total_score > 0:
+                consensus = max(call_score, put_score) / total_score
+                if consensus > 0.8:  # Высокое согласие
+                    confidence = min(10, confidence + 2)
+                elif consensus > 0.7:  # Умеренное согласие
+                    confidence = min(10, confidence + 1)
+                elif consensus < 0.55:  # Низкое согласие
+                    confidence = max(3, confidence - 1)
+
+            # Волатильность (более мягкие штрафы)
+            if volatility_multiplier > 2.0:
+                confidence = max(3, confidence - 2)
+                signal_reasons.append("экстремальная волатильность")
+            elif volatility_multiplier > 1.5:
+                confidence = max(4, confidence - 1)
+                signal_reasons.append("высокая волатильность")
+            elif volatility_multiplier < 0.5:
+                confidence = max(3, confidence - 1)
+                signal_reasons.append("очень низкая волатильность")
+
+            # Проверка противоречий
+            contradiction_penalty = 0
+            if (rsi > 70 and bb_position < 0.3) or (rsi < 30 and bb_position > 0.7):
+                contradiction_penalty += 1
+            if (stoch_k > 80 and williams_r < -80) or (stoch_k < 20 and williams_r > -20):
+                contradiction_penalty += 1
+
+            if contradiction_penalty > 0:
+                confidence = max(1, confidence - contradiction_penalty)
+                signal_reasons.append("противоречивые сигналы")
+
+            # Определяем экспирацию с учетом волатильности
             if timeframe in ['1m', '3m']:
-                expiration = "2"
+                expiration = "2" if volatility_multiplier > 1.2 else "3"
             elif timeframe in ['5m', '15m']:
-                expiration = "3"
+                expiration = "3" if volatility_multiplier > 1.2 else "4"
             else:
                 expiration = "5"
 
-            # Берем главные причины
-            main_reasons = signal_reasons[:2] if signal_reasons else ["смешанные сигналы"]
+            # Ограничиваем количество причин
+            main_reasons = signal_reasons[:3] if signal_reasons else ["нейтральные условия"]
             reason = ", ".join(main_reasons)
 
             return f"""🎯 СИГНАЛ: {signal_type}
 📊 УВЕРЕННОСТЬ: {confidence}/10
 ⏰ ЭКСПИРАЦИЯ: {expiration} мин
 💡 ПРИЧИНА: {reason}
-
-📈 CALL: {call_score} баллов ({call_percentage:.1f}%)
-📉 PUT: {put_score} баллов ({put_percentage:.1f}%)
-🔍 АНАЛИЗ: {len(signal_reasons)} сигналов из {total_weight} возможных"""
+🔥 ВОЛАТИЛЬНОСТЬ: {volatility_multiplier:.1f}x"""
 
         except Exception as e:
             return f"""🎯 СИГНАЛ: ЖДАТЬ
-📊 УВЕРЕННОСТЬ: 3/10
-⏰ ЭКСПИРАЦИЯ: 3 мин
-💡 ПРИЧИНА: ошибка анализа"""
+📊 УВЕРЕННОСТЬ: 1/10
+⏰ ЭКСПИРАЦИЯ: 5 мин
+💡 ПРИЧИНА: системная ошибка"""
+
+    def calculate_dynamic_volatility(self, atr: float, price: float, timeframe: str) -> float:
+        """Расчет динамического волатильного мультипликатора"""
+        try:
+            if price <= 0:
+                return 1.0
+
+            # Базовый мультипликатор по таймфрейму
+            tf_multipliers = {
+                '1m': 1.5, '3m': 1.3, '5m': 1.2, 
+                '15m': 1.1, '30m': 1.0, '1h': 0.9
+            }
+
+            base_mult = tf_multipliers.get(timeframe, 1.0)
+            volatility_ratio = atr / (price * 0.005)  # Нормализация
+
+            # Адаптивная формула
+            dynamic_mult = base_mult * (1 + np.log(1 + volatility_ratio))
+            return min(3.0, max(0.3, dynamic_mult))
+        except:
+            return 1.0
+
+    def detect_market_regime(self, indicators: Dict[str, Any]) -> str:
+        """Определение рыночного режима (тренд/флет/разворот)"""
+        try:
+            rsi = indicators.get('rsi', 50)
+            bb_position = indicators.get('bb_position', 0.5)
+            macd = indicators.get('macd', 0)
+            macd_signal = indicators.get('macd_signal', 0)
+            aroon_up = indicators.get('aroon_up', 50)
+            aroon_down = indicators.get('aroon_down', 50)
+
+            # Критерии для определения режима
+            trend_strength = abs(aroon_up - aroon_down)
+            momentum_strength = abs(macd - macd_signal) * 100000
+            volatility_level = abs(bb_position - 0.5) * 2
+
+            if trend_strength > 60 and momentum_strength > 2:
+                return "СИЛЬНЫЙ_ТРЕНД"
+            elif trend_strength > 30:
+                return "СЛАБЫЙ_ТРЕНД"  
+            elif volatility_level < 0.3 and 40 < rsi < 60:
+                return "ФЛЕТ"
+            elif (rsi > 75 or rsi < 25) and momentum_strength > 1:
+                return "РАЗВОРОТ"
+            else:
+                return "НЕОПРЕДЕЛЕННОСТЬ"
+        except:
+            return "НЕОПРЕДЕЛЕННОСТЬ"
+
+    def calculate_ml_weights(self, indicators: Dict[str, Any], pair: str, timeframe: str) -> Dict[str, float]:
+        """Расчет весов с использованием машинного обучения"""
+        try:
+            # Базовые веса (обученные на исторических данных)
+            base_weights = {
+                'rsi': 2.5,
+                'stochastic': 3.0,
+                'williams': 2.8,
+                'macd': 2.2,
+                'bollinger': 2.0,
+                'cci': 1.8,
+                'mfi': 1.5,
+                'aroon': 1.7,
+                'ultimate': 1.3
+            }
+
+            # Адаптация весов под условия рынка
+            market_regime = self.detect_market_regime(indicators)
+            volatility = indicators.get('atr', 0.001)
+
+            # Модификация весов в зависимости от режима рынка
+            if market_regime == "СИЛЬНЫЙ_ТРЕНД":
+                base_weights['macd'] *= 1.5
+                base_weights['aroon'] *= 1.4
+                base_weights['rsi'] *= 0.8  # RSI менее надежен в трендах
+            elif market_regime == "ФЛЕТ":
+                base_weights['bollinger'] *= 1.6
+                base_weights['rsi'] *= 1.3
+                base_weights['stochastic'] *= 1.3
+            elif market_regime == "РАЗВОРОТ":
+                base_weights['rsi'] *= 1.8
+                base_weights['williams'] *= 1.6
+                base_weights['stochastic'] *= 1.5
+
+            # Адаптация под волатильность
+            vol_multiplier = min(1.5, max(0.7, volatility * 100000))
+            for key in base_weights:
+                base_weights[key] *= vol_multiplier
+
+            # Адаптация под валютную пару
+            pair_adjustments = {
+                'EUR/USD': {'rsi': 1.1, 'macd': 1.2},
+                'GBP/USD': {'bollinger': 1.2, 'volatility': 1.1},
+                'USD/JPY': {'aroon': 1.2, 'cci': 1.1},
+                'AUD/USD': {'williams': 1.1, 'mfi': 1.2}
+            }
+
+            if pair in pair_adjustments:
+                for indicator, mult in pair_adjustments[pair].items():
+                    if indicator in base_weights:
+                        base_weights[indicator] *= mult
+
+            return base_weights
+        except:
+            return {
+                'rsi': 2.0, 'stochastic': 2.5, 'williams': 2.3,
+                'macd': 2.0, 'bollinger': 1.8, 'cci': 1.5,
+                'mfi': 1.3, 'aroon': 1.5, 'ultimate': 1.2
+            }
+
+    def calculate_stochastic_neural_score(self, stoch_k: float, stoch_d: float, market_regime: str) -> float:
+        """Нейросетевой анализ Stochastic с учетом рыночного режима"""
+        try:
+            # Базовый сигнал
+            if stoch_k < 15 and stoch_d < 20:
+                base_signal = 0.9  # Очень сильный бычий
+            elif stoch_k > 85 and stoch_d > 80:
+                base_signal = -0.9  # Очень сильный медвежий
+            elif stoch_k < 25:
+                base_signal = 0.6
+            elif stoch_k > 75:
+                base_signal = -0.6
+            elif stoch_k < 35:
+                base_signal = 0.3
+            elif stoch_k > 65:
+                base_signal = -0.3
+            else:
+                base_signal = 0.0
+
+            # Модификация под режим рынка
+            if market_regime == "СИЛЬНЫЙ_ТРЕНД":
+                # В тренде осцилляторы менее надежны
+                base_signal *= 0.7
+            elif market_regime == "ФЛЕТ":
+                # В флете осцилляторы более точны
+                base_signal *= 1.3
+            elif market_regime == "РАЗВОРОТ":
+                # При развороте максимальная точность
+                base_signal *= 1.5
+
+            # Учет дивергенции между %K и %D
+            divergence = abs(stoch_k - stoch_d)
+            if divergence > 10:
+                base_signal *= 1.2  # Дивергенция усиливает сигнал
+
+            return max(-1.0, min(1.0, base_signal))
+        except:
+            return 0.0
+
+    def calculate_rsi_neural_score(self, rsi: float, market_regime: str, bb_position: float) -> float:
+        """Нейросетевая оценка RSI с контекстом"""
+        try:
+            # Базовый сигнал RSI
+            if rsi < 20:
+                base_signal = 0.95
+            elif rsi > 80:
+                base_signal = -0.95
+            elif rsi < 30:
+                base_signal = 0.7
+            elif rsi > 70:
+                base_signal = -0.7
+            elif rsi < 40:
+                base_signal = 0.3
+            elif rsi > 60:
+                base_signal = -0.3
+            else:
+                base_signal = 0.0
+
+            # Контекстная корректировка
+            if market_regime == "СИЛЬНЫЙ_ТРЕНД":
+                # В сильном тренде RSI может оставаться в экстремальных зонах
+                if abs(base_signal) > 0.7:
+                    base_signal *= 0.6
+
+            # Подтверждение от Bollinger Bands
+            if (base_signal > 0 and bb_position < 0.3) or (base_signal < 0 and bb_position > 0.7):
+                base_signal *= 1.3  # Подтверждение усиливает сигнал
+            elif (base_signal > 0 and bb_position > 0.7) or (base_signal < 0 and bb_position < 0.3):
+                base_signal *= 0.5  # Противоречие ослабляет сигнал
+
+            return max(-1.0, min(1.0, base_signal))
+        except:
+            return 0.0
+
+    def calculate_macd_neural_score(self, macd: float, macd_signal: float, market_regime: str) -> float:
+        """Нейросетевая оценка MACD"""
+        try:
+            macd_diff = macd - macd_signal
+
+            # Определяем силу сигнала
+            if abs(macd_diff) > 0.0005:
+                strength = 0.9
+            elif abs(macd_diff) > 0.0003:
+                strength = 0.7
+            elif abs(macd_diff) > 0.0001:
+                strength = 0.5
+            else:
+                strength = 0.2
+
+            signal = strength if macd_diff > 0 else -strength
+
+            # Адаптация под режим рынка
+            if market_regime == "СИЛЬНЫЙ_ТРЕНД":
+                signal *= 1.4  # MACD очень точен в трендах
+            elif market_regime == "ФЛЕТ":
+                signal *= 0.6  # Менее надежен в флете
+
+            return max(-1.0, min(1.0, signal))
+        except:
+            return 0.0
+
+    def calculate_pattern_recognition_score(self, indicators: Dict[str, Any]) -> float:
+        """Распознавание паттернов с помощью ИИ"""
+        try:
+            patterns_score = 0
+
+            # Паттерн "Тройное дно"
+            rsi = indicators.get('rsi', 50)
+            bb_position = indicators.get('bb_position', 0.5)
+            williams_r = indicators.get('williams_r', -50)
+
+            if (rsi < 25 and bb_position < 0.2 and williams_r < -85):
+                patterns_score += 0.8  # Сильный паттерн разворота вверх
+
+            # Паттерн "Тройная вершина"
+            elif (rsi > 75 and bb_position > 0.8 and williams_r > -15):
+                patterns_score -= 0.8  # Сильный паттерн разворота вниз
+
+            # Паттерн "Расхождение RSI-MACD"
+            macd = indicators.get('macd', 0)
+            macd_signal = indicators.get('macd_signal', 0)
+
+            if (rsi < 30 and macd > macd_signal):
+                patterns_score += 0.6  # Бычья дивергенция
+            elif (rsi > 70 and macd < macd_signal):
+                patterns_score -= 0.6  # Медвежья дивергенция
+
+            return max(-1.0, min(1.0, patterns_score))
+        except:
+            return 0.0
+
+    def calculate_williams_neural_score(self, williams_r: float, market_regime: str) -> float:
+        """Нейросетевая оценка Williams %R"""
+        try:
+            if williams_r < -90:
+                base_signal = 0.95
+            elif williams_r > -10:
+                base_signal = -0.95
+            elif williams_r < -80:
+                base_signal = 0.7
+            elif williams_r > -20:
+                base_signal = -0.7
+            elif williams_r < -70:
+                base_signal = 0.4
+            elif williams_r > -30:
+                base_signal = -0.4
+            else:
+                base_signal = 0.0
+
+            # Адаптация под режим рынка
+            if market_regime == "РАЗВОРОТ":
+                base_signal *= 1.4
+            elif market_regime == "ФЛЕТ":
+                base_signal *= 1.2
+            elif market_regime == "СИЛЬНЫЙ_ТРЕНД":
+                base_signal *= 0.8
+
+            return max(-1.0, min(1.0, base_signal))
+        except:
+            return 0.0
+
+    def calculate_final_neural_decision(self, call_score: float, put_score: float, 
+                                      indicators: Dict[str, Any], market_regime: str) -> tuple:
+        """Финальное нейросетевое решение"""
+        try:
+            # Добавляем паттерн-анализ
+            pattern_score = self.calculate_pattern_recognition_score(indicators)
+
+            if pattern_score > 0.5:
+                call_score += pattern_score * 2
+            elif pattern_score < -0.5:
+                put_score += abs(pattern_score) * 2
+
+            # Нейросетевая нормализация
+            total_score = call_score + put_score
+
+            if total_score == 0:
+                return "ЖДАТЬ", 4, "нет четких сигналов"
+
+            # Расчет уверенности с учетом режима рынка (улучшенная формула)
+            confidence_multiplier = {
+                "СИЛЬНЫЙ_ТРЕНД": 1.5,
+                "СЛАБЫЙ_ТРЕНД": 1.2,
+                "ФЛЕТ": 1.3,
+                "РАЗВОРОТ": 1.6,
+                "НЕОПРЕДЕЛЕННОСТЬ": 1.0  # Повышен с 0.7
+            }
+
+            mult = confidence_multiplier.get(market_regime, 1.0)
+
+            if call_score > put_score:
+                score_diff = call_score - put_score
+                # Улучшенная формула: базовая уверенность 6 + score_diff
+                base_confidence = 6 + min(3, score_diff)
+                confidence = min(10, int(base_confidence * mult))
+                return "CALL", confidence, f"бычий сигнал {score_diff:.1f}, режим: {market_regime}"
+            elif put_score > call_score:
+                score_diff = put_score - call_score  
+                # Улучшенная формула: базовая уверенность 6 + score_diff
+                base_confidence = 6 + min(3, score_diff)
+                confidence = min(10, int(base_confidence * mult))
+                return "PUT", confidence, f"медвежий сигнал {score_diff:.1f}, режим: {market_regime}"
+            else:
+                return "ЖДАТЬ", 5, "равные сигналы"
+
+        except Exception as e:
+            return "ЖДАТЬ", 4, "ошибка расчета"
+
+    def analyze_chart_patterns(self, indicators: Dict[str, Any]) -> Dict[str, Any]:
+        """Анализ графических паттернов как профессиональный трейдер"""
+        try:
+            rsi = indicators.get('rsi', 50)
+            bb_position = indicators.get('bb_position', 0.5)
+            macd = indicators.get('macd', 0)
+            macd_signal = indicators.get('macd_signal', 0)
+            williams_r = indicators.get('williams_r', -50)
+            
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Паттерн "Двойное дно" 
+            if rsi < 25 and williams_r < -85 and bb_position < 0.15:
+                call_strength += 3.5
+                reason = "двойное дно на графике"
+            
+            # Паттерн "Двойная вершина"
+            elif rsi > 75 and williams_r > -15 and bb_position > 0.85:
+                put_strength += 3.5
+                reason = "двойная вершина на графике"
+            
+            # Паттерн "Восходящий треугольник"
+            elif rsi > 55 and macd > macd_signal and bb_position > 0.6:
+                call_strength += 2.5
+                reason = "восходящий треугольник"
+                
+            # Паттерн "Нисходящий треугольник"
+            elif rsi < 45 and macd < macd_signal and bb_position < 0.4:
+                put_strength += 2.5
+                reason = "нисходящий треугольник"
+                
+            # Паттерн "Флаг" (продолжение тренда)
+            elif 40 < rsi < 60 and 0.3 < bb_position < 0.7:
+                if macd > macd_signal:
+                    call_strength += 1.5
+                    reason = "бычий флаг"
+                else:
+                    put_strength += 1.5
+                    reason = "медвежий флаг"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_market_psychology(self, indicators: Dict[str, Any], pair: str) -> Dict[str, Any]:
+        """Анализ психологии рынка и поведения участников"""
+        try:
+            rsi = indicators.get('rsi', 50)
+            stoch_k = indicators.get('stoch_k', 50)
+            mfi = indicators.get('mfi', 50)
+            cci = indicators.get('cci', 0)
+            
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Анализ страха и жадности
+            fear_greed_index = (rsi + stoch_k + mfi) / 3
+            
+            if fear_greed_index < 25:  # Экстремальный страх
+                call_strength += 3.0
+                reason = "экстремальный страх рынка - время покупать"
+            elif fear_greed_index > 75:  # Экстремальная жадность
+                put_strength += 3.0
+                reason = "экстремальная жадность рынка - время продавать"
+            
+            # Поведение толпы vs умные деньги
+            if cci < -200 and rsi < 25:  # Толпа продает, умные деньги покупают
+                call_strength += 2.5  
+                reason = "умные деньги против толпы - покупка"
+            elif cci > 200 and rsi > 75:  # Толпа покупает, умные деньги продают
+                put_strength += 2.5
+                reason = "умные деньги против толпы - продажа"
+            
+            # Психологические уровни (круглые числа)
+            current_price = indicators.get('current_price', 0)
+            if current_price > 0:
+                price_str = f"{current_price:.4f}"
+                if price_str.endswith('0000') or price_str.endswith('5000'):
+                    call_strength += 1.0
+                    put_strength += 1.0  # Круглые уровни - разворотные точки
+                    reason += ", психологический уровень"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_support_resistance(self, indicators: Dict[str, Any], current_price: float) -> Dict[str, Any]:
+        """Анализ уровней поддержки и сопротивления"""
+        try:
+            bb_upper = indicators.get('bb_upper', 0)
+            bb_lower = indicators.get('bb_lower', 0)
+            sma_20 = indicators.get('sma_20', 0)
+            sma_50 = indicators.get('sma_50', 0)
+            
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            if current_price > 0 and bb_upper > 0 and bb_lower > 0:
+                # Пробой уровня сопротивления
+                if current_price > bb_upper * 1.001:
+                    call_strength += 2.5
+                    reason = "пробой сопротивления"
+                
+                # Отскок от поддержки
+                elif current_price < bb_lower * 1.001 and current_price > bb_lower * 0.999:
+                    call_strength += 2.0
+                    reason = "отскок от поддержки"
+                
+                # Пробой поддержки
+                elif current_price < bb_lower * 0.999:
+                    put_strength += 2.5
+                    reason = "пробой поддержки"
+                
+                # Отскок от сопротивления
+                elif current_price > bb_upper * 0.999 and current_price < bb_upper * 1.001:
+                    put_strength += 2.0
+                    reason = "отскок от сопротивления"
+            
+            # Динамические уровни поддержки/сопротивления (скользящие средние)
+            if current_price > 0 and sma_20 > 0:
+                if current_price > sma_20 * 1.005:  # Сильно выше SMA20
+                    if current_price > sma_50 * 1.005:  # И выше SMA50
+                        call_strength += 1.5
+                        reason += ", сильный восходящий тренд"
+                elif current_price < sma_20 * 0.995:  # Сильно ниже SMA20
+                    if current_price < sma_50 * 0.995:  # И ниже SMA50
+                        put_strength += 1.5
+                        reason += ", сильный нисходящий тренд"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_institutional_flows(self, indicators: Dict[str, Any], pair: str, timeframe: str) -> Dict[str, Any]:
+        """Анализ институциональных потоков (движение больших денег)"""
+        try:
+            mfi = indicators.get('mfi', 50)
+            volume_sma = indicators.get('volume_sma', 0)
+            atr = indicators.get('atr', 0.001)
+            macd = indicators.get('macd', 0)
+            
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Анализ притока капитала
+            if mfi > 0:
+                if mfi > 80:  # Сильный приток капитала
+                    if macd > 0:  # С позитивным импульсом
+                        call_strength += 2.0
+                        reason = "институциональный приток капитала"
+                    else:
+                        put_strength += 1.5  # Возможно распределение
+                        reason = "институциональное распределение"
+                elif mfi < 20:  # Отток капитала
+                    if macd < 0:  # С негативным импульсом
+                        put_strength += 2.0
+                        reason = "институциональный отток капитала"
+                    else:
+                        call_strength += 1.5  # Возможна аккумуляция
+                        reason = "институциональная аккумуляция"
+            
+            # Анализ объема (если доступен)
+            if volume_sma > 0:
+                # Высокий объем указывает на институциональную активность
+                call_strength += 0.5
+                put_strength += 0.5
+                reason += ", высокая институциональная активность"
+            
+            # Особенности по валютным парам (центробанки и интервенции)
+            if pair == "USD/JPY":
+                if atr > 0.008:  # Высокая волатильность может указывать на интервенции BOJ
+                    put_strength += 1.0
+                    reason += ", возможна интервенция BOJ"
+            elif pair == "EUR/USD":
+                if atr > 0.006:  # ECB intervention signals
+                    call_strength += 0.5
+                    put_strength += 0.5
+                    reason += ", возможна активность ECB"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_market_correlations(self, pair: str, timeframe: str) -> Dict[str, Any]:
+        """Анализ межрыночных корреляций"""
+        try:
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Корреляции валютных пар
+            if pair == "EUR/USD":
+                # EUR/USD обычно коррелирует с риск-аппетитом
+                call_strength += 1.0
+                reason = "позитивная корреляция с риск-аппетитом"
+            elif pair == "USD/JPY":
+                # USD/JPY - классическая пара риск-он/риск-офф
+                call_strength += 1.2
+                reason = "индикатор глобального риск-аппетита"
+            elif pair == "GBP/USD":
+                # GBP чувствителен к новостям и настроениям
+                put_strength += 0.5
+                call_strength += 0.5
+                reason = "высокая чувствительность к новостям"
+            elif pair == "AUD/USD":
+                # AUD коррелирует с товарными рынками
+                call_strength += 0.8
+                reason = "корреляция с товарными рынками"
+            
+            # Временные факторы
+            if timeframe in ['1m', '3m', '5m']:
+                # На малых таймфреймах корреляции работают сильнее
+                call_strength *= 1.2
+                put_strength *= 1.2
+                reason += ", краткосрочная корреляция"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_fundamental_factors(self, pair: str, timeframe: str) -> Dict[str, Any]:
+        """Анализ фундаментальных факторов"""
+        try:
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            moscow_time = datetime.now(moscow_tz)
+            hour = moscow_time.hour
+            weekday = moscow_time.weekday()
+            
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Сезонность и время торговых сессий
+            if 8 <= hour <= 12:  # Европейская сессия
+                if pair.startswith('EUR') or pair.startswith('GBP'):
+                    call_strength += 1.0
+                    put_strength += 1.0
+                    reason = "активная европейская сессия"
+            elif 15 <= hour <= 19:  # Американская сессия
+                if 'USD' in pair:
+                    call_strength += 1.2
+                    put_strength += 1.2
+                    reason = "активная американская сессия"
+            elif 2 <= hour <= 6:  # Азиатская сессия
+                if pair.endswith('JPY') or pair.startswith('AUD'):
+                    call_strength += 0.8
+                    put_strength += 0.8
+                    reason = "азиатская торговая сессия"
+            
+            # Недельная сезонность
+            if weekday == 0:  # Понедельник
+                call_strength += 0.5
+                reason += ", понедельничные тренды"
+            elif weekday == 4:  # Пятница
+                put_strength += 0.3
+                call_strength += 0.3
+                reason += ", пятничное закрытие позиций"
+            
+            # Конец месяца/квартала (фиксация прибыли)
+            day = moscow_time.day
+            if day >= 28:  # Конец месяца
+                put_strength += 0.5
+                reason += ", конец месяца - фиксация прибыли"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_time_cycles(self, timeframe: str) -> Dict[str, Any]:
+        """Анализ временных циклов"""
+        try:
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            moscow_time = datetime.now(moscow_tz)
+            minute = moscow_time.minute
+            
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Оптимальные временные окна для входа
+            if timeframe == '1m':
+                # Для 1-минутного TF лучше входить в начале минуты
+                if 0 <= minute % 5 <= 1:
+                    call_strength += 1.5
+                    put_strength += 1.5
+                    reason = "оптимальное время входа для 1m"
+            elif timeframe == '5m':
+                # Для 5-минутного TF - в начале 5-минутного цикла
+                if minute % 5 == 0:
+                    call_strength += 2.0
+                    put_strength += 2.0
+                    reason = "начало 5-минутного цикла"
+            elif timeframe == '15m':
+                # Для 15-минутного - в начале четверти часа
+                if minute % 15 == 0:
+                    call_strength += 2.5
+                    put_strength += 2.5
+                    reason = "начало 15-минутного цикла"
+            
+            # Избегаем входов в середине циклов
+            if timeframe == '5m' and minute % 5 == 2:
+                call_strength -= 1.0
+                put_strength -= 1.0
+                reason += ", середина цикла - менее надежно"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def analyze_global_sentiment(self, pair: str) -> Dict[str, Any]:
+        """Анализ глобальных рыночных настроений"""
+        try:
+            call_strength = 0
+            put_strength = 0
+            reason = ""
+            
+            # Общий риск-аппетит на рынке (упрощенная модель)
+            # В реальности это анализ индексов, VIX, спредов и т.д.
+            
+            # Базовая оценка по валютным парам
+            if pair in ['EUR/USD', 'GBP/USD', 'AUD/USD']:
+                # Эти пары обычно растут при позитивном риск-аппетите
+                call_strength += 1.0
+                reason = "позитивный глобальный риск-аппетит"
+            elif pair == 'USD/JPY':
+                # USD/JPY - классический индикатор настроений
+                call_strength += 1.5
+                reason = "индикатор глобальных настроений"
+            elif pair in ['USD/CHF', 'USD/CAD']:
+                # Более консервативные пары
+                call_strength += 0.5
+                put_strength += 0.5
+                reason = "стабильные валюты в неопределенности"
+            
+            # Дополнительные факторы времени
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            hour = datetime.now(moscow_tz).hour
+            
+            if 9 <= hour <= 18:  # Дневные часы - обычно больше оптимизма
+                call_strength += 0.3
+                reason += ", дневная торговля"
+            else:  # Ночные часы - больше осторожности
+                put_strength += 0.2
+                reason += ", ночная торговля"
+            
+            return {'call_strength': call_strength, 'put_strength': put_strength, 'reason': reason}
+        except:
+            return {'call_strength': 0, 'put_strength': 0, 'reason': ''}
+
+    def calculate_contradiction_penalty(self, indicators: Dict[str, Any]) -> float:
+        """Расчет штрафа за противоречивые сигналы"""
+        try:
+            contradictions = 0
+            total_checks = 0
+
+            rsi = indicators.get('rsi', 50)
+            macd = indicators.get('macd', 0)
+            macd_signal = indicators.get('macd_signal', 0)
+            bb_position = indicators.get('bb_position', 0.5)
+            stoch_k = indicators.get('stoch_k', 50)
+            williams_r = indicators.get('williams_r', -50)
+
+            # Проверка противоречий RSI vs MACD
+            rsi_bullish = rsi < 30
+            macd_bullish = macd > macd_signal
+            if (rsi_bullish and not macd_bullish) or (not rsi_bullish and macd_bullish):
+                contradictions += 1
+            total_checks += 1
+
+            # Проверка RSI vs Bollinger
+            bb_bullish = bb_position < 0.3
+            if (rsi_bullish and not bb_bullish) or (not rsi_bullish and bb_bullish):
+                contradictions += 1
+            total_checks += 1
+
+            # Проверка Stochastic vs Williams
+            stoch_bullish = stoch_k < 20
+            williams_bullish = williams_r < -80
+            if (stoch_bullish and not williams_bullish) or (not stoch_bullish and williams_bullish):
+                contradictions += 1
+            total_checks += 1
+
+            return contradictions / total_checks if total_checks > 0 else 0
+        except:
+            return 0.5
+
+    def calculate_time_consistency(self, indicators: Dict[str, Any], timeframe: str) -> float:
+        """Расчет временной согласованности (смягченная версия)"""
+        try:
+            # Коэффициенты надежности по таймфреймам (повышены)
+            tf_reliability = {
+                '1m': 0.85,  # Увеличено с 0.6
+                '3m': 0.88,  # Увеличено с 0.7
+                '5m': 0.92,  # Увеличено с 0.8
+                '15m': 0.95, # Увеличено с 0.9
+                '30m': 0.98, # Увеличено с 0.95
+                '1h': 1.0    # Максимально надежный
+            }
+
+            base_reliability = tf_reliability.get(timeframe, 0.9)
+
+            # Дополнительная проверка волатильности (смягченная)
+            atr = indicators.get('atr', 0.001)
+            price = indicators.get('current_price', 1)
+
+            volatility_ratio = atr / (price * 0.01) if price > 0 else 1
+
+            # Корректировка на волатильность (более мягкая)
+            if volatility_ratio > 3:
+                base_reliability *= 0.85  # Меньший штраф
+            elif volatility_ratio > 2:
+                base_reliability *= 0.92
+            elif volatility_ratio < 0.3:
+                base_reliability *= 0.95  # Меньший штраф за низкую волатильность
+
+            return max(0.8, min(1.0, base_reliability))  # Минимум повышен до 0.8
+        except:
+            return 0.9
 
 def render_signal_card(analysis_text: str, pair: str, current_price: float):
     """Рендерит карточку сигнала в стиле Telegram"""
@@ -1196,39 +1994,73 @@ def render_signal_card(analysis_text: str, pair: str, current_price: float):
     """, unsafe_allow_html=True)
 
 def render_metrics(indicators: Dict[str, Any]):
-    """Рендерит расширенные метрики в стиле Telegram"""
+    """Рендерит ВСЕ рассчитанные индикаторы в стиле Telegram"""
 
+    # Получаем ВСЕ индикаторы
     rsi = indicators.get('rsi', 50)
     macd = indicators.get('macd', 0)
+    macd_signal = indicators.get('macd_signal', 0)
+    macd_histogram = indicators.get('macd_histogram', 0)
     bb_position = indicators.get('bb_position', 0.5)
+    bb_upper = indicators.get('bb_upper', 0)
+    bb_middle = indicators.get('bb_middle', 0)
+    bb_lower = indicators.get('bb_lower', 0)
     price_change = indicators.get('price_change', 0)
+    current_price = indicators.get('current_price', 0)
     
-    # Все новые индикаторы
-    mfi = indicators.get('mfi', 50)
-    cci = indicators.get('cci', 0)
-    adx = indicators.get('adx', 25)
+    # Скользящие средние
+    sma_20 = indicators.get('sma_20', 0)
+    sma_50 = indicators.get('sma_50', 0)
+    ema_12 = indicators.get('ema_12', 0)
+    ema_26 = indicators.get('ema_26', 0)
+    
+    # Осцилляторы
     stoch_k = indicators.get('stoch_k', 50)
-    ultimate_oscillator = indicators.get('ultimate_oscillator', 50)
-    aroon_oscillator = indicators.get('aroon_oscillator', 0)
-    tsi = indicators.get('tsi', 0)
-    roc = indicators.get('roc', 0)
+    stoch_d = indicators.get('stoch_d', 50)
+    williams_r = indicators.get('williams_r', -50)
+    cci = indicators.get('cci', 0)
+    mfi = indicators.get('mfi', 50)
+    uo = indicators.get('ultimate_oscillator', 50)
+    trix = indicators.get('trix', 0)
+    
+    # Волатильность и тренд
+    atr = indicators.get('atr', 0.001)
+    aroon_up = indicators.get('aroon_up', 50)
+    aroon_down = indicators.get('aroon_down', 50)
+    volume_sma = indicators.get('volume_sma', 0)
 
-    # Определяем статусы для всех индикаторов
-    rsi_status = "🔴" if rsi > 75 else "🟢" if rsi < 25 else "🟡"
-    macd_status = "📈" if macd > 0 else "📉"
+    # Функция для определения статуса индикаторов
+    def get_rsi_status(val):
+        return "🔴" if val > 70 else "🟢" if val < 30 else "🟡"
+    
+    def get_stoch_status(val):
+        return "🔴" if val > 80 else "🟢" if val < 20 else "🟡"
+    
+    def get_williams_status(val):
+        return "🔴" if val > -20 else "🟢" if val < -80 else "🟡"
+    
+    def get_cci_status(val):
+        return "🔴" if val > 100 else "🟢" if val < -100 else "🟡"
+    
+    def get_mfi_status(val):
+        return "🔴" if val > 80 else "🟢" if val < 20 else "🟡"
+
+    # Статусы
+    rsi_status = get_rsi_status(rsi)
+    macd_status = "📈" if macd > macd_signal else "📉"
     bb_status = "🔴" if bb_position > 0.8 else "🟢" if bb_position < 0.2 else "🟡"
     price_status = "positive" if price_change > 0 else "negative"
+    stoch_status = get_stoch_status(stoch_k)
+    williams_status = get_williams_status(williams_r)
+    cci_status = get_cci_status(cci)
+    mfi_status = get_mfi_status(mfi)
     
-    # Статусы новых индикаторов
-    mfi_status = "🔴" if mfi > 85 else "🟢" if mfi < 15 else "🟡"
-    cci_status = "🔴" if cci > 150 else "🟢" if cci < -150 else "🟡"
-    adx_status = "💪" if adx > 35 else "😴"
-    stoch_status = "🔴" if stoch_k > 85 else "🟢" if stoch_k < 15 else "🟡"
-    uo_status = "🔴" if ultimate_oscillator > 75 else "🟢" if ultimate_oscillator < 25 else "🟡"
-    aroon_status = "📈" if aroon_oscillator > 70 else "📉" if aroon_oscillator < -70 else "🟡"
-    tsi_status = "📈" if tsi > 20 else "📉" if tsi < -20 else "🟡"
-    roc_status = "📈" if roc > 2 else "📉" if roc < -2 else "🟡"
+    # Aroon статус
+    aroon_diff = aroon_up - aroon_down
+    aroon_status = "📈" if aroon_diff > 20 else "📉" if aroon_diff < -20 else "🟡"
 
+    # Основные метрики (всегда показываем)
+    st.markdown("#### 📊 Основные индикаторы")
     st.markdown(f"""
     <div class="metric-container">
         <div class="metric-card">
@@ -1236,311 +2068,273 @@ def render_metrics(indicators: Dict[str, Any]):
             <div class="metric-value">{rsi:.1f} {rsi_status}</div>
         </div>
         <div class="metric-card">
-            <div class="metric-label">MFI</div>
-            <div class="metric-value">{mfi:.1f} {mfi_status}</div>
+            <div class="metric-label">MACD</div>
+            <div class="metric-value">{macd:.5f} {macd_status}</div>
         </div>
         <div class="metric-card">
-            <div class="metric-label">CCI</div>
-            <div class="metric-value">{cci:.0f} {cci_status}</div>
+            <div class="metric-label">MACD Signal</div>
+            <div class="metric-value">{macd_signal:.5f}</div>
         </div>
         <div class="metric-card">
-            <div class="metric-label">Stochastic</div>
-            <div class="metric-value">{stoch_k:.1f} {stoch_status}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">Ultimate Osc</div>
-            <div class="metric-value">{ultimate_oscillator:.1f} {uo_status}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">Aroon Osc</div>
-            <div class="metric-value">{aroon_oscillator:.0f} {aroon_status}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">TSI</div>
-            <div class="metric-value">{tsi:.1f} {tsi_status}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">ROC</div>
-            <div class="metric-value">{roc:.1f}% {roc_status}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">ADX (Сила)</div>
-            <div class="metric-value">{adx:.1f} {adx_status}</div>
+            <div class="metric-label">MACD Histogram</div>
+            <div class="metric-value">{macd_histogram:.5f}</div>
         </div>
         <div class="metric-card">
             <div class="metric-label">BB Позиция</div>
             <div class="metric-value">{bb_position:.0%} {bb_status}</div>
         </div>
         <div class="metric-card">
-            <div class="metric-label">MACD</div>
-            <div class="metric-value">{macd:.4f} {macd_status}</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-label">Изменение</div>
+            <div class="metric-label">Изменение цены</div>
             <div class="metric-value metric-change {price_status}">{price_change:+.2f}%</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-def render_analysis_explanation(indicators: Dict[str, Any], analysis_text: str, pair: str):
-    """Рендерит подробное объяснение анализа с ВСЕМИ 15+ индикаторами"""
+    # Полосы Боллинджера (детали)
+    st.markdown("#### 🎭 Bollinger Bands")
+    st.markdown(f"""
+    <div class="metric-container">
+        <div class="metric-card">
+            <div class="metric-label">BB Верхняя</div>
+            <div class="metric-value">{bb_upper:.5f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">BB Средняя</div>
+            <div class="metric-value">{bb_middle:.5f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">BB Нижняя</div>
+            <div class="metric-value">{bb_lower:.5f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Текущая цена</div>
+            <div class="metric-value">{current_price:.5f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Получаем ВСЕ индикаторы
+    # Скользящие средние
+    st.markdown("#### 📈 Скользящие средние")
+    st.markdown(f"""
+    <div class="metric-container">
+        <div class="metric-card">
+            <div class="metric-label">SMA 20</div>
+            <div class="metric-value">{sma_20:.5f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">SMA 50</div>
+            <div class="metric-value">{sma_50:.5f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">EMA 12</div>
+            <div class="metric-value">{ema_12:.5f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">EMA 26</div>
+            <div class="metric-value">{ema_26:.5f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Осцилляторы
+    st.markdown("#### 🎚️ Осцилляторы")
+    st.markdown(f"""
+    <div class="metric-container">
+        <div class="metric-card">
+            <div class="metric-label">Stochastic %K</div>
+            <div class="metric-value">{stoch_k:.1f} {stoch_status}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Stochastic %D</div>
+            <div class="metric-value">{stoch_d:.1f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Williams %R</div>
+            <div class="metric-value">{williams_r:.1f} {williams_status}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">CCI</div>
+            <div class="metric-value">{cci:.1f} {cci_status}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">MFI</div>
+            <div class="metric-value">{mfi:.1f} {mfi_status}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Ultimate Osc.</div>
+            <div class="metric-value">{uo:.1f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">TRIX</div>
+            <div class="metric-value">{trix:.6f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Трендовые индикаторы
+    st.markdown("#### 📊 Трендовые индикаторы")
+    st.markdown(f"""
+    <div class="metric-container">
+        <div class="metric-card">
+            <div class="metric-label">Aroon Up</div>
+            <div class="metric-value">{aroon_up:.1f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Aroon Down</div>
+            <div class="metric-value">{aroon_down:.1f}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">Aroon Тренд</div>
+            <div class="metric-value">{aroon_status}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">ATR</div>
+            <div class="metric-value">{atr:.5f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Объемные индикаторы (если есть данные)
+    if volume_sma > 0:
+        st.markdown("#### 📊 Объемные индикаторы")
+        st.markdown(f"""
+        <div class="metric-container">
+            <div class="metric-card">
+                <div class="metric-label">Volume SMA</div>
+                <div class="metric-value">{volume_sma:,.0f}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Итоговая статистика всех индикаторов
+    total_indicators = 20  # Общее количество рассчитываемых индикаторов
+    
+    # Подсчет бычьих/медвежьих сигналов
+    bullish_count = 0
+    bearish_count = 0
+    neutral_count = 0
+    
+    # RSI
+    if rsi < 30:
+        bullish_count += 1
+    elif rsi > 70:
+        bearish_count += 1
+    else:
+        neutral_count += 1
+    
+    # MACD
+    if macd > macd_signal:
+        bullish_count += 1
+    else:
+        bearish_count += 1
+    
+    # BB
+    if bb_position < 0.2:
+        bullish_count += 1
+    elif bb_position > 0.8:
+        bearish_count += 1
+    else:
+        neutral_count += 1
+    
+    # Stochastic
+    if stoch_k < 20:
+        bullish_count += 1
+    elif stoch_k > 80:
+        bearish_count += 1
+    else:
+        neutral_count += 1
+    
+    # Williams %R
+    if williams_r < -80:
+        bullish_count += 1
+    elif williams_r > -20:
+        bearish_count += 1
+    else:
+        neutral_count += 1
+
+    st.markdown("#### 📈 Общая статистика индикаторов")
+    st.markdown(f"""
+    <div class="metric-container">
+        <div class="metric-card">
+            <div class="metric-label">📈 Бычьих</div>
+            <div class="metric-value" style="color: #4CAF50;">{bullish_count}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">📉 Медвежьих</div>
+            <div class="metric-value" style="color: #f44336;">{bearish_count}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">⚪ Нейтральных</div>
+            <div class="metric-value" style="color: #ff9800;">{neutral_count}</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-label">🔢 Всего</div>
+            <div class="metric-value" style="color: #667eea;">{total_indicators}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def render_analysis_explanation(indicators: Dict[str, Any], analysis_text: str, pair: str):
+    """Рендерит подробное объяснение анализа - полностью совместимо со Streamlit"""
+
     rsi = indicators.get('rsi', 50)
     macd = indicators.get('macd', 0)
     macd_signal = indicators.get('macd_signal', 0)
     bb_position = indicators.get('bb_position', 0.5)
     current_price = indicators.get('current_price', 0)
     sma_20 = indicators.get('sma_20', 0)
-    sma_50 = indicators.get('sma_50', 0)
-    ema_12 = indicators.get('ema_12', 0)
-    ema_26 = indicators.get('ema_26', 0)
     stoch_k = indicators.get('stoch_k', 50)
-    stoch_d = indicators.get('stoch_d', 50)
     williams_r = indicators.get('williams_r', -50)
     atr = indicators.get('atr', 0)
-    
-    # НОВЫЕ РАСШИРЕННЫЕ ИНДИКАТОРЫ
-    mfi = indicators.get('mfi', 50)
-    cci = indicators.get('cci', 0)
-    adx = indicators.get('adx', 25)
-    psar = indicators.get('psar', current_price)
-    ultimate_oscillator = indicators.get('ultimate_oscillator', 50)
-    aroon_up = indicators.get('aroon_up', 50)
-    aroon_down = indicators.get('aroon_down', 50)
-    aroon_oscillator = indicators.get('aroon_oscillator', 0)
-    kc_position = indicators.get('kc_position', 0.5)
-    kc_upper = indicators.get('kc_upper', 0)
-    kc_middle = indicators.get('kc_middle', 0)
-    kc_lower = indicators.get('kc_lower', 0)
-    tsi = indicators.get('tsi', 0)
-    vwap = indicators.get('vwap', current_price)
-    roc = indicators.get('roc', 0)
-    ichimoku_position = indicators.get('ichimoku_position', 0)
-    ichimoku_a = indicators.get('ichimoku_a', current_price)
-    ichimoku_b = indicators.get('ichimoku_b', current_price)
 
-    # Подсчет подтверждающих индикаторов - ПОЛНЫЙ АНАЛИЗ ВСЕХ 15+ ИНДИКАТОРОВ
+    # Подсчет подтверждающих индикаторов
     call_indicators = []
     put_indicators = []
     neutral_indicators = []
 
-    # 1. RSI анализ
-    if rsi < 25:
-        call_indicators.append("RSI экстремально перепродан")
-    elif rsi < 35:
-        call_indicators.append("RSI перепродан")
-    elif rsi > 75:
-        put_indicators.append("RSI экстремально перекуплен")
-    elif rsi > 65:
-        put_indicators.append("RSI перекуплен")
+    # RSI анализ
+    if rsi < 30:
+        call_indicators.append("RSI (перепроданность)")
+    elif rsi > 70:
+        put_indicators.append("RSI (перекупленность)")
     else:
-        neutral_indicators.append("RSI нейтральная зона")
+        neutral_indicators.append("RSI (нейтральная зона)")
 
-    # 2. MFI анализ (НОВЫЙ)
-    if mfi < 15:
-        call_indicators.append("MFI экстремально перепродан")
-    elif mfi < 25:
-        call_indicators.append("MFI перепродан")
-    elif mfi > 85:
-        put_indicators.append("MFI экстремально перекуплен")
-    elif mfi > 75:
-        put_indicators.append("MFI перекуплен")
+    # MACD анализ
+    if macd > macd_signal:
+        call_indicators.append("MACD (выше сигнальной)")
     else:
-        neutral_indicators.append("MFI нейтральная зона")
+        put_indicators.append("MACD (ниже сигнальной)")
 
-    # 3. CCI анализ (НОВЫЙ)
-    if cci < -150:
-        call_indicators.append("CCI экстремально перепродан")
-    elif cci < -100:
-        call_indicators.append("CCI перепродан")
-    elif cci > 150:
-        put_indicators.append("CCI экстремально перекуплен")
-    elif cci > 100:
-        put_indicators.append("CCI перекуплен")
+    # Bollinger Bands
+    if bb_position < 0.2:
+        call_indicators.append("Bollinger Bands (нижняя граница)")
+    elif bb_position > 0.8:
+        put_indicators.append("Bollinger Bands (верхняя граница)")
     else:
-        neutral_indicators.append("CCI нейтральная зона")
+        neutral_indicators.append("Bollinger Bands (средняя зона)")
 
-    # 4. Ultimate Oscillator анализ (НОВЫЙ)
-    if ultimate_oscillator < 25:
-        call_indicators.append("Ultimate Oscillator перепродан")
-    elif ultimate_oscillator > 75:
-        put_indicators.append("Ultimate Oscillator перекуплен")
+    # Stochastic анализ (сильные сигналы)
+    if stoch_k < 20:
+        call_indicators.append("Stochastic (перепроданность)")
+    elif stoch_k > 80:
+        put_indicators.append("Stochastic (перекупленность)")
     else:
-        neutral_indicators.append("Ultimate Oscillator нейтрален")
+        neutral_indicators.append("Stochastic (нейтральная зона)")
 
-    # 5. TSI анализ (НОВЫЙ)
-    if tsi < -20:
-        call_indicators.append("TSI медвежий экстремум")
-    elif tsi > 20:
-        put_indicators.append("TSI бычий экстремум")
+    # Williams %R анализ (сильные сигналы)
+    if williams_r < -80:
+        call_indicators.append("Williams %R (перепроданность)")
+    elif williams_r > -20:
+        put_indicators.append("Williams %R (перекупленность)")
     else:
-        neutral_indicators.append("TSI нейтральная зона")
+        neutral_indicators.append("Williams %R (нейтральная зона)")
 
-    # 6. Aroon Oscillator анализ (НОВЫЙ)
-    if aroon_oscillator > 70:
-        call_indicators.append("Aroon сильный восходящий тренд")
-    elif aroon_oscillator < -70:
-        put_indicators.append("Aroon сильный нисходящий тренд")
-    elif aroon_oscillator > 30:
-        call_indicators.append("Aroon слабый восходящий тренд")
-    elif aroon_oscillator < -30:
-        put_indicators.append("Aroon слабый нисходящий тренд")
-    else:
-        neutral_indicators.append("Aroon боковой тренд")
-
-    # 7. ROC анализ (НОВЫЙ)
-    if roc > 2:
-        call_indicators.append("ROC сильный рост")
-    elif roc > 0.5:
-        call_indicators.append("ROC умеренный рост")
-    elif roc < -2:
-        put_indicators.append("ROC сильное падение")
-    elif roc < -0.5:
-        put_indicators.append("ROC умеренное падение")
-    else:
-        neutral_indicators.append("ROC стабильность")
-
-    # 8. ADX анализ силы тренда (НОВЫЙ)
-    if adx > 35:
-        if call_indicators and len(call_indicators) > len(put_indicators):
-            call_indicators.append("ADX подтверждает сильный восходящий тренд")
-        elif put_indicators and len(put_indicators) > len(call_indicators):
-            put_indicators.append("ADX подтверждает сильный нисходящий тренд")
-        else:
-            neutral_indicators.append("ADX показывает сильный тренд")
-    elif adx > 25:
-        neutral_indicators.append("ADX умеренная сила тренда")
-    else:
-        neutral_indicators.append("ADX слабый тренд")
-
-    # 9. Parabolic SAR анализ (НОВЫЙ)
-    psar_diff = abs(current_price - psar) / current_price
-    if current_price > psar and psar_diff > 0.001:
-        call_indicators.append("PSAR бычий тренд")
-    elif current_price < psar and psar_diff > 0.001:
-        put_indicators.append("PSAR медвежий тренд")
-    else:
-        neutral_indicators.append("PSAR нейтральная зона")
-
-    # 10. Ichimoku Cloud анализ (НОВЫЙ)
-    if ichimoku_position == 1:
-        call_indicators.append("Ichimoku выше облака")
-    elif ichimoku_position == -1:
-        put_indicators.append("Ichimoku ниже облака")
-    else:
-        neutral_indicators.append("Ichimoku в облаке")
-
-    # 11. VWAP анализ (НОВЫЙ)
-    vwap_diff = (current_price - vwap) / vwap
-    if vwap_diff > 0.01:
-        call_indicators.append("VWAP цена значительно выше")
-    elif vwap_diff > 0.003:
-        call_indicators.append("VWAP цена выше")
-    elif vwap_diff < -0.01:
-        put_indicators.append("VWAP цена значительно ниже")
-    elif vwap_diff < -0.003:
-        put_indicators.append("VWAP цена ниже")
-    else:
-        neutral_indicators.append("VWAP цена близко")
-
-    # 12. Keltner Channel анализ (НОВЫЙ)
-    if kc_position < 0.15:
-        call_indicators.append("Keltner Channel нижняя граница")
-    elif kc_position > 0.85:
-        put_indicators.append("Keltner Channel верхняя граница")
-    elif kc_position < 0.35:
-        call_indicators.append("Keltner Channel нижняя треть")
-    elif kc_position > 0.65:
-        put_indicators.append("Keltner Channel верхняя треть")
-    else:
-        neutral_indicators.append("Keltner Channel средняя зона")
-
-    # 13. MACD анализ (улучшенный)
-    macd_diff = macd - macd_signal
-    if macd > macd_signal and macd_diff > 0.0001:
-        if macd > 0:
-            call_indicators.append("MACD сильный бычий сигнал")
-        else:
-            call_indicators.append("MACD слабый бычий сигнал")
-    elif macd < macd_signal and abs(macd_diff) > 0.0001:
-        if macd < 0:
-            put_indicators.append("MACD сильный медвежий сигнал")
-        else:
-            put_indicators.append("MACD слабый медвежий сигнал")
-    else:
-        neutral_indicators.append("MACD нейтральный сигнал")
-
-    # 14. Bollinger Bands анализ (улучшенный)
-    if bb_position < 0.1:
-        call_indicators.append("Bollinger Bands экстремально низ")
-    elif bb_position < 0.25:
-        call_indicators.append("Bollinger Bands нижняя граница")
-    elif bb_position > 0.9:
-        put_indicators.append("Bollinger Bands экстремально верх")
-    elif bb_position > 0.75:
-        put_indicators.append("Bollinger Bands верхняя граница")
-    else:
-        neutral_indicators.append("Bollinger Bands средняя зона")
-
-    # 15. Stochastic анализ (улучшенный)
-    if stoch_k < 15 and stoch_d < 15:
-        call_indicators.append("Stochastic экстремально перепродан")
-    elif stoch_k < 25:
-        call_indicators.append("Stochastic перепродан")
-    elif stoch_k > 85 and stoch_d > 85:
-        put_indicators.append("Stochastic экстремально перекуплен")
-    elif stoch_k > 75:
-        put_indicators.append("Stochastic перекуплен")
-    else:
-        neutral_indicators.append("Stochastic нейтральная зона")
-
-    # 16. Williams %R анализ (улучшенный)
-    if williams_r < -85:
-        call_indicators.append("Williams %R экстремально перепродан")
-    elif williams_r < -75:
-        call_indicators.append("Williams %R перепродан")
-    elif williams_r > -15:
-        put_indicators.append("Williams %R экстремально перекуплен")
-    elif williams_r > -25:
-        put_indicators.append("Williams %R перекуплен")
-    else:
-        neutral_indicators.append("Williams %R нейтральная зона")
-
-    # 17. Анализ скользящих средних (расширенный)
-    ma_signals = 0
-    ma_explanations = []
-    
+    # Тренд (SMA20)
     if current_price > sma_20:
-        ma_signals += 1
-        ma_explanations.append("цена выше SMA20")
+        call_indicators.append("SMA20 (цена выше)")
     else:
-        ma_explanations.append("цена ниже SMA20")
-        
-    if current_price > sma_50:
-        ma_signals += 1
-        ma_explanations.append("цена выше SMA50")
-    else:
-        ma_explanations.append("цена ниже SMA50")
-        
-    if ema_12 > ema_26:
-        ma_signals += 1
-        ma_explanations.append("EMA12 выше EMA26")
-    else:
-        ma_explanations.append("EMA12 ниже EMA26")
-        
-    if sma_20 > sma_50:
-        ma_signals += 1
-        ma_explanations.append("SMA20 выше SMA50")
-    else:
-        ma_explanations.append("SMA20 ниже SMA50")
-    
-    if ma_signals >= 3:
-        call_indicators.append(f"Скользящие средние восходящий тренд ({ma_signals}/4)")
-    elif ma_signals <= 1:
-        put_indicators.append(f"Скользящие средние нисходящий тренд ({ma_signals}/4)")
-    else:
-        neutral_indicators.append(f"Скользящие средние смешанные сигналы ({ma_signals}/4)")
+        put_indicators.append("SMA20 (цена ниже)")
 
     # Определяем общий сигнал из анализа
     signal_from_analysis = "ЖДАТЬ"
@@ -1864,290 +2658,9 @@ def render_analysis_explanation(indicators: Dict[str, Any], analysis_text: str, 
         st.write(f"**Объяснение:** {trend_interpretation}")
         st.caption("📊 SMA20 - скользящая средняя за 20 периодов, показывает общий тренд")
 
-    # РАСШИРЕННЫЕ ИНДИКАТОРЫ - ВСЕ 15+ НОВЫХ
-    st.subheader("🔍 Расширенный анализ всех 15+ индикаторов")
+    # Дополнительные индикаторы
+    st.subheader("🔍 Дополнительные сигналы")
 
-    # MFI анализ (НОВЫЙ)
-    with st.expander("💰 MFI (Money Flow Index) - Денежный поток", expanded=False):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**Текущее значение:** {mfi:.1f}")
-            if mfi < 15:
-                st.success("🟢 Экстремально перепродан - сильный сигнал покупки")
-                mfi_interpretation = f"MFI {mfi:.1f} показывает экстремальную перепроданность. Деньги покидают актив слишком быстро."
-            elif mfi < 25:
-                st.success("🟢 Перепродан - сигнал покупки")
-                mfi_interpretation = f"MFI {mfi:.1f} указывает на перепроданность. Возможен отскок."
-            elif mfi > 85:
-                st.error("🔴 Экстремально перекуплен - сильный сигнал продажи")
-                mfi_interpretation = f"MFI {mfi:.1f} показывает экстремальную перекупленность. Деньги входят слишком агрессивно."
-            elif mfi > 75:
-                st.error("🔴 Перекуплен - сигнал продажи")
-                mfi_interpretation = f"MFI {mfi:.1f} указывает на перекупленность. Возможна коррекция."
-            else:
-                st.info("🟡 Нейтральная зона")
-                mfi_interpretation = f"MFI {mfi:.1f} находится в нейтральной зоне. Денежный поток сбалансирован."
-            st.write(f"**Интерпретация:** {mfi_interpretation}")
-        with col2:
-            st.metric("MFI", f"{mfi:.1f}", help="0-20: Перепродан, 80-100: Перекуплен")
-        mfi_normalized = max(0.0, min(1.0, mfi / 100))
-        st.progress(mfi_normalized)
-        st.caption("💰 MFI учитывает объем торгов и показывает приток/отток денег")
-
-    # CCI анализ (НОВЫЙ)
-    with st.expander("📊 CCI (Commodity Channel Index) - Канальный индекс", expanded=False):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**Текущее значение:** {cci:.1f}")
-            if cci < -150:
-                st.success("🟢 Экстремально перепродан")
-                cci_interpretation = f"CCI {cci:.1f} показывает экстремальную перепроданность. Цена далеко от средних значений."
-            elif cci < -100:
-                st.success("🟢 Перепродан")
-                cci_interpretation = f"CCI {cci:.1f} указывает на перепроданность."
-            elif cci > 150:
-                st.error("🔴 Экстремально перекуплен")
-                cci_interpretation = f"CCI {cci:.1f} показывает экстремальную перекупленность."
-            elif cci > 100:
-                st.error("🔴 Перекуплен")
-                cci_interpretation = f"CCI {cci:.1f} указывает на перекупленность."
-            else:
-                st.info("🟡 Нейтральная зона")
-                cci_interpretation = f"CCI {cci:.1f} в нормальном диапазоне."
-            st.write(f"**Интерпретация:** {cci_interpretation}")
-        with col2:
-            st.metric("CCI", f"{cci:.1f}", help="-200 до +200, экстремумы за ±100")
-        st.caption("📊 CCI измеряет отклонение цены от статистического среднего")
-
-    # Ultimate Oscillator анализ (НОВЫЙ)
-    with st.expander("🎯 Ultimate Oscillator - Составной осциллятор", expanded=False):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**Текущее значение:** {ultimate_oscillator:.1f}")
-            if ultimate_oscillator < 25:
-                st.success("🟢 Перепродан")
-                uo_interpretation = f"UO {ultimate_oscillator:.1f} показывает перепроданность на трех таймфреймах."
-            elif ultimate_oscillator > 75:
-                st.error("🔴 Перекуплен")
-                uo_interpretation = f"UO {ultimate_oscillator:.1f} показывает перекупленность на трех таймфреймах."
-            else:
-                st.info("🟡 Нейтральная зона")
-                uo_interpretation = f"UO {ultimate_oscillator:.1f} показывает сбалансированность."
-            st.write(f"**Интерпретация:** {uo_interpretation}")
-        with col2:
-            st.metric("UO", f"{ultimate_oscillator:.1f}", help="Комбинирует 3 периода: 7, 14, 28")
-        uo_normalized = max(0.0, min(1.0, ultimate_oscillator / 100))
-        st.progress(uo_normalized)
-        st.caption("🎯 Ultimate Oscillator использует 3 периода для снижения ложных сигналов")
-
-    # TSI анализ (НОВЫЙ)
-    with st.expander("⚡ TSI (True Strength Index) - Истинная сила", expanded=False):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**Текущее значение:** {tsi:.1f}")
-            if tsi < -20:
-                st.success("🟢 Медвежий экстремум - возможен разворот вверх")
-                tsi_interpretation = f"TSI {tsi:.1f} показывает медвежий экстремум. Сильное давление продавцов."
-            elif tsi > 20:
-                st.error("🔴 Бычий экстремум - возможен разворот вниз")
-                tsi_interpretation = f"TSI {tsi:.1f} показывает бычий экстремум. Сильное давление покупателей."
-            else:
-                st.info("🟡 Нейтральная зона")
-                tsi_interpretation = f"TSI {tsi:.1f} показывает сбалансированные силы."
-            st.write(f"**Интерпретация:** {tsi_interpretation}")
-        with col2:
-            st.metric("TSI", f"{tsi:.1f}", help="Двойное сглаживание импульса")
-        st.caption("⚡ TSI показывает истинную силу тренда с двойным сглаживанием")
-
-    # Aroon анализ (НОВЫЙ)
-    with st.expander("🌊 Aroon Oscillator - Трендовый анализ", expanded=False):
-        col1, col2, col3 = st.columns([2, 2, 2])
-        with col1:
-            st.metric("Aroon Up", f"{aroon_up:.1f}")
-        with col2:
-            st.metric("Aroon Down", f"{aroon_down:.1f}")
-        with col3:
-            st.metric("Oscillator", f"{aroon_oscillator:.1f}")
-        
-        if aroon_oscillator > 70:
-            st.success("🟢 Сильный восходящий тренд")
-            aroon_interpretation = f"Aroon показывает сильный восходящий тренд. Up={aroon_up:.1f}, Down={aroon_down:.1f}"
-        elif aroon_oscillator < -70:
-            st.error("🔴 Сильный нисходящий тренд")
-            aroon_interpretation = f"Aroon показывает сильный нисходящий тренд. Up={aroon_up:.1f}, Down={aroon_down:.1f}"
-        elif aroon_oscillator > 30:
-            st.info("📈 Слабый восходящий тренд")
-            aroon_interpretation = f"Aroon показывает слабый восходящий тренд."
-        elif aroon_oscillator < -30:
-            st.info("📉 Слабый нисходящий тренд")
-            aroon_interpretation = f"Aroon показывает слабый нисходящий тренд."
-        else:
-            st.warning("🟡 Боковой тренд")
-            aroon_interpretation = f"Aroon показывает боковое движение."
-        
-        st.write(f"**Интерпретация:** {aroon_interpretation}")
-        st.caption("🌊 Aroon измеряет время с момента последних максимумов и минимумов")
-
-    # ROC анализ (НОВЫЙ)
-    with st.expander("🚀 ROC (Rate of Change) - Скорость изменения", expanded=False):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**Текущее значение:** {roc:.2f}%")
-            if roc > 2:
-                st.success("🟢 Сильный рост")
-                roc_interpretation = f"ROC {roc:.2f}% показывает сильное ускорение роста цены."
-            elif roc > 0.5:
-                st.info("📈 Умеренный рост")
-                roc_interpretation = f"ROC {roc:.2f}% показывает умеренный рост."
-            elif roc < -2:
-                st.error("🔴 Сильное падение")
-                roc_interpretation = f"ROC {roc:.2f}% показывает сильное ускорение падения."
-            elif roc < -0.5:
-                st.warning("📉 Умеренное падение")
-                roc_interpretation = f"ROC {roc:.2f}% показывает умеренное падение."
-            else:
-                st.info("🟡 Стабильность")
-                roc_interpretation = f"ROC {roc:.2f}% показывает стабильность цены."
-            st.write(f"**Интерпретация:** {roc_interpretation}")
-        with col2:
-            st.metric("ROC", f"{roc:.2f}%", help="Изменение цены в процентах")
-        st.caption("🚀 ROC показывает скорость изменения цены за период")
-
-    # ADX анализ (НОВЫЙ)
-    with st.expander("💪 ADX (Average Directional Index) - Сила тренда", expanded=False):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.write(f"**Текущее значение:** {adx:.1f}")
-            if adx > 35:
-                st.success("💪 Очень сильный тренд")
-                adx_interpretation = f"ADX {adx:.1f} показывает очень сильный тренд. Трендовые стратегии предпочтительны."
-            elif adx > 25:
-                st.info("📈 Умеренный тренд")
-                adx_interpretation = f"ADX {adx:.1f} показывает умеренную силу тренда."
-            else:
-                st.warning("😴 Слабый тренд")
-                adx_interpretation = f"ADX {adx:.1f} показывает слабый тренд. Боковое движение."
-            st.write(f"**Интерпретация:** {adx_interpretation}")
-        with col2:
-            st.metric("ADX", f"{adx:.1f}", help="25+ сильный тренд, <25 слабый")
-        adx_normalized = max(0.0, min(1.0, adx / 60))
-        st.progress(adx_normalized)
-        st.caption("💪 ADX не показывает направление, только силу тренда")
-
-    # Parabolic SAR анализ (НОВЫЙ)
-    with st.expander("🎯 Parabolic SAR - Стоп и разворот", expanded=False):
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            st.metric("Цена", f"{current_price:.5f}")
-        with col2:
-            st.metric("PSAR", f"{psar:.5f}")
-        with col3:
-            psar_diff = abs(current_price - psar) / current_price * 100
-            st.metric("Расстояние", f"{psar_diff:.2f}%")
-        
-        if current_price > psar:
-            st.success("📈 Бычий тренд - цена выше PSAR")
-            psar_interpretation = f"Цена {current_price:.5f} выше PSAR {psar:.5f}. Восходящий тренд."
-        elif current_price < psar:
-            st.error("📉 Медвежий тренд - цена ниже PSAR")
-            psar_interpretation = f"Цена {current_price:.5f} ниже PSAR {psar:.5f}. Нисходящий тренд."
-        else:
-            st.info("🟡 Точка разворота")
-            psar_interpretation = f"Цена близко к PSAR. Возможный разворот тренда."
-        
-        st.write(f"**Интерпретация:** {psar_interpretation}")
-        st.caption("🎯 PSAR следует за ценой и показывает точки разворота тренда")
-
-    # Ichimoku анализ (НОВЫЙ)
-    with st.expander("☁️ Ichimoku Cloud - Облако Ишимоку", expanded=False):
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            st.metric("Senkou A", f"{ichimoku_a:.5f}")
-        with col2:
-            st.metric("Senkou B", f"{ichimoku_b:.5f}")
-        with col3:
-            if ichimoku_position == 1:
-                st.success("☁️ Выше")
-            elif ichimoku_position == -1:
-                st.error("☁️ Ниже")
-            else:
-                st.warning("☁️ В облаке")
-        
-        if ichimoku_position == 1:
-            st.success("📈 Цена выше облака - сильный бычий сигнал")
-            ichimoku_interpretation = f"Цена находится выше облака Ишимоку. Сильный восходящий тренд."
-        elif ichimoku_position == -1:
-            st.error("📉 Цена ниже облака - сильный медвежий сигнал")
-            ichimoku_interpretation = f"Цена находится ниже облака Ишимоку. Сильный нисходящий тренд."
-        else:
-            st.warning("☁️ Цена в облаке - неопределенность")
-            ichimoku_interpretation = f"Цена находится внутри облака. Неопределенный тренд."
-        
-        st.write(f"**Интерпретация:** {ichimoku_interpretation}")
-        st.caption("☁️ Ichimoku - комплексная система анализа тренда")
-
-    # VWAP анализ (НОВЫЙ)
-    with st.expander("📊 VWAP (Volume Weighted Average Price) - Объемная цена", expanded=False):
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            st.metric("Цена", f"{current_price:.5f}")
-        with col2:
-            st.metric("VWAP", f"{vwap:.5f}")
-        with col3:
-            vwap_diff_percent = ((current_price - vwap) / vwap) * 100
-            st.metric("Разница", f"{vwap_diff_percent:+.2f}%")
-        
-        if vwap_diff_percent > 1:
-            st.success("📈 Цена значительно выше VWAP")
-            vwap_interpretation = f"Цена на {vwap_diff_percent:.2f}% выше VWAP. Сильное давление покупателей."
-        elif vwap_diff_percent > 0.3:
-            st.info("📈 Цена выше VWAP")
-            vwap_interpretation = f"Цена выше VWAP. Умеренное давление покупателей."
-        elif vwap_diff_percent < -1:
-            st.error("📉 Цена значительно ниже VWAP")
-            vwap_interpretation = f"Цена на {abs(vwap_diff_percent):.2f}% ниже VWAP. Сильное давление продавцов."
-        elif vwap_diff_percent < -0.3:
-            st.warning("📉 Цена ниже VWAP")
-            vwap_interpretation = f"Цена ниже VWAP. Умеренное давление продавцов."
-        else:
-            st.info("🟡 Цена близко к VWAP")
-            vwap_interpretation = f"Цена близко к VWAP. Сбалансированный рынок."
-        
-        st.write(f"**Интерпретация:** {vwap_interpretation}")
-        st.caption("📊 VWAP показывает среднюю цену с учетом объемов торгов")
-
-    # Keltner Channel анализ (НОВЫЙ)
-    with st.expander("📈 Keltner Channel - Канал Кельтнера", expanded=False):
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
-            st.metric("Верх", f"{kc_upper:.5f}")
-        with col2:
-            st.metric("Низ", f"{kc_lower:.5f}")
-        with col3:
-            st.metric("Позиция", f"{kc_position:.0%}")
-        
-        if kc_position < 0.15:
-            st.success("📈 Нижняя граница - сигнал покупки")
-            kc_interpretation = f"Цена у нижней границы Keltner Channel ({kc_position:.0%}). Возможен отскок вверх."
-        elif kc_position > 0.85:
-            st.error("📉 Верхняя граница - сигнал продажи")
-            kc_interpretation = f"Цена у верхней границы Keltner Channel ({kc_position:.0%}). Возможна коррекция вниз."
-        elif kc_position < 0.35:
-            st.info("📈 Нижняя треть")
-            kc_interpretation = f"Цена в нижней трети канала ({kc_position:.0%})."
-        elif kc_position > 0.65:
-            st.warning("📉 Верхняя треть")
-            kc_interpretation = f"Цена в верхней трети канала ({kc_position:.0%})."
-        else:
-            st.info("🟡 Средняя зона")
-            kc_interpretation = f"Цена в средней зоне канала ({kc_position:.0%})."
-        
-        st.write(f"**Интерпретация:** {kc_interpretation}")
-        kc_normalized = max(0.0, min(1.0, kc_position))
-        st.progress(kc_normalized)
-        st.caption("📈 Keltner Channel основан на ATR и показывает волатильность")
-
-    # Стандартные индикаторы с улучшенным отображением
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -2156,13 +2669,9 @@ def render_analysis_explanation(indicators: Dict[str, Any], analysis_text: str, 
             f"{stoch_k:.1f}",
             help="0-20: Перепродан, 80-100: Перекуплен"
         )
-        if stoch_k < 15:
-            st.success("🟢 Экстремально перепродан")
-        elif stoch_k < 25:
+        if stoch_k < 20:
             st.success("🟢 Перепродан")
-        elif stoch_k > 85:
-            st.error("🔴 Экстремально перекуплен")
-        elif stoch_k > 75:
+        elif stoch_k > 80:
             st.error("🔴 Перекуплен")
         else:
             st.info("🟡 Нейтрален")
@@ -2173,13 +2682,9 @@ def render_analysis_explanation(indicators: Dict[str, Any], analysis_text: str, 
             f"{williams_r:.1f}",
             help="-100 до -80: Перепродан, -20 до 0: Перекуплен"
         )
-        if williams_r < -85:
-            st.success("🟢 Экстремально перепродан")
-        elif williams_r < -75:
+        if williams_r < -80:
             st.success("🟢 Перепродан")
-        elif williams_r > -15:
-            st.error("🔴 Экстремально перекуплен")
-        elif williams_r > -25:
+        elif williams_r > -20:
             st.error("🔴 Перекуплен")
         else:
             st.info("🟡 Нейтрален")
@@ -2193,29 +2698,6 @@ def render_analysis_explanation(indicators: Dict[str, Any], analysis_text: str, 
         if atr > 0:
             volatility_level = "Высокая" if atr > current_price * 0.01 else "Умеренная"
             st.info(f"📊 {volatility_level}")
-
-    # Анализ скользящих средних
-    with st.expander("📈 Анализ скользящих средних", expanded=False):
-        st.write("**Анализ всех скользящих средних:**")
-        for explanation in ma_explanations:
-            if "выше" in explanation:
-                st.success(f"✅ {explanation}")
-            else:
-                st.error(f"❌ {explanation}")
-        
-        st.write(f"**Общий сигнал скользящих средних:** {ma_signals}/4 бычьих сигналов")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("SMA20", f"{sma_20:.5f}")
-        with col2:
-            st.metric("SMA50", f"{sma_50:.5f}")
-        with col3:
-            st.metric("EMA12", f"{ema_12:.5f}")
-        with col4:
-            st.metric("EMA26", f"{ema_26:.5f}")
-        
-        st.caption("📈 Скользящие средние показывают общее направление тренда")
 
     # Обучающая секция
     st.subheader("📚 Как понимать сигналы")
@@ -2299,22 +2781,81 @@ def main():
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # API ключ в компактном виде
-    with st.expander("🔑 Настройки API", expanded=False):
-        api_key = st.text_input(
-            "OpenAI API Key (для ИИ анализа)",
-            value=st.session_state.get('openai_api_key', ''),
-            type="password",
-            help="Введите ваш API ключ от OpenAI"
-        )
+    # Продвинутые настройки
+    with st.expander("⚙️ Продвинутые настройки", expanded=False):
+        col1, col2 = st.columns(2)
 
-        if api_key != st.session_state.get('openai_api_key', ''):
-            st.session_state.openai_api_key = api_key
-            st.session_state.analyzer.gpt_api_key = api_key
-            if api_key and api_key.startswith('sk-'):
-                st.success("✅ API ключ обновлен")
-            elif api_key:
-                st.error("❌ Неверный формат API ключа")
+        with col1:
+            st.subheader("🔑 API настройки")
+            api_key = st.text_input(
+                "OpenAI API Key",
+                value=st.session_state.get('openai_api_key', ''),
+                type="password",
+                help="Введите ваш API ключ от OpenAI"
+            )
+
+            if api_key != st.session_state.get('openai_api_key', ''):
+                st.session_state.openai_api_key = api_key
+                st.session_state.analyzer.gpt_api_key = api_key
+                if api_key and api_key.startswith('sk-'):
+                    st.success("✅ API ключ обновлен")
+                elif api_key:
+                    st.error("❌ Неверный формат API ключа")
+
+        with col2:
+            st.subheader("🎯 Фильтры анализа")
+
+            # Настройки риск-менеджмента
+            min_confidence = st.slider(
+                "Минимальная уверенность для сигналов",
+                min_value=1,
+                max_value=8,
+                value=st.session_state.get('min_confidence', 5),
+                help="Сигналы с уверенностью ниже этого порога будут отфильтрованы"
+            )
+            st.session_state.min_confidence = min_confidence
+
+            # Настройка волатильности
+            volatility_filter = st.checkbox(
+                "Фильтровать по волатильности",
+                value=st.session_state.get('volatility_filter', True),
+                help="Исключать торговлю при экстремальной волатильности"
+            )
+            st.session_state.volatility_filter = volatility_filter
+
+            # Настройка времени
+            time_filter = st.checkbox(
+                "Учитывать торговое время",
+                value=st.session_state.get('time_filter', True),
+                help="Предупреждать о неподходящем времени для торговли"
+            )
+            st.session_state.time_filter = time_filter
+
+        # Индикаторы для отображения
+        st.subheader("📊 Отображение индикаторов")
+        indicator_cols = st.columns(4)
+
+        with indicator_cols[0]:
+            show_advanced = st.checkbox("Расширенные индикаторы", value=True)
+        with indicator_cols[1]:
+            show_volume = st.checkbox("Объемные индикаторы", value=True)
+        with indicator_cols[2]:
+            show_volatility = st.checkbox("Анализ волатильности", value=True)
+        with indicator_cols[3]:
+            show_warnings = st.checkbox("Предупреждения о рисках", value=True)
+
+        st.session_state.update({
+            'show_advanced': show_advanced,
+            'show_volume': show_volume, 
+            'show_volatility': show_volatility,
+            'show_warnings': show_warnings
+        })
+
+    # Проверка времени торговли
+    trading_allowed, time_message = is_trading_time()
+
+    if not trading_allowed:
+        st.warning(f"⏰ {time_message}. Торговля не рекомендуется в это время.")
 
     # Главная кнопка анализа
     if st.button("🚀 АНАЛИЗИРОВАТЬ", key="main_analyze"):
@@ -2350,11 +2891,67 @@ def main():
                 progress_bar.empty()
                 status_text.empty()
 
+                # Анализ волатильности
+                volatility_info = get_market_volatility(market_data)
+
+                # Отображаем информацию о волатильности
+                st.markdown(f"""
+                <div class="telegram-card">
+                    <h4>📊 Анализ волатильности</h4>
+                    <p><strong>Уровень:</strong> {volatility_info['level']}</p>
+                    <p><strong>Коэффициент:</strong> {volatility_info['ratio']:.2f}</p>
+                    <p><strong>Рекомендация:</strong> {volatility_info['trade_recommendation']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
                 # Отображаем результат
                 current_price = indicators.get('current_price', 0)
-                
+
                 # Проверяем валидность индикаторов перед отображением
                 if current_price > 0:
+                    # Применяем фильтры из настроек
+                    min_confidence = st.session_state.get('min_confidence', 5)
+                    volatility_filter = st.session_state.get('volatility_filter', True)
+                    time_filter = st.session_state.get('time_filter', True)
+                    show_warnings = st.session_state.get('show_warnings', True)
+
+                    # Извлекаем уверенность из анализа
+                    confidence_match = re.search(r'УВЕРЕННОСТЬ:\s*(\d+)/10', analysis)
+                    current_confidence = int(confidence_match.group(1)) if confidence_match else 5
+
+                    # Проверка временного фильтра
+                    if time_filter:
+                        trading_allowed, time_message = is_trading_time()
+                        if not trading_allowed:
+                            st.error(f"⏰ {time_message}. Рекомендуется дождаться подходящего времени.")
+
+                    # Проверка волатильности
+                    volatility_info = get_market_volatility(market_data)
+                    if volatility_filter and volatility_info['level'] in ['Очень высокая', 'Критическая']:
+                        st.warning(f"🌊 Экстремальная волатильность ({volatility_info['level']}) - повышенные риски!")
+
+                    # Получаем и отображаем предупреждения
+                    if show_warnings:
+                        risk_warnings = get_risk_warnings(indicators, selected_pair, selected_timeframe)
+                        if risk_warnings:
+                            st.markdown('<div class="telegram-card">', unsafe_allow_html=True)
+                            st.markdown("### ⚠️ Система предупреждений")
+                            for warning in risk_warnings:
+                                st.warning(warning)
+                            st.markdown('</div>', unsafe_allow_html=True)
+
+                    # Проверка минимальной уверенности
+                    if current_confidence < min_confidence:
+                        st.markdown(f"""
+                        <div class="telegram-card" style="border: 2px solid #ff9800;">
+                            <div style="text-align: center; color: #ff9800;">
+                                <h3>🚫 СИГНАЛ ОТФИЛЬТРОВАН</h3>
+                                <p>Уверенность {current_confidence}/10 ниже минимального порога {min_confidence}/10</p>
+                                <p><small>Измените настройки или дождитесь более сильного сигнала</small></p>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
                     render_signal_card(analysis, selected_pair, current_price)
 
                     # Метрики в компактном виде
@@ -2362,7 +2959,7 @@ def main():
                     st.markdown("### 📊 Ключевые индикаторы")
                     render_metrics(indicators)
                     st.markdown('</div>', unsafe_allow_html=True)
-                    
+
                     # Отладочная информация (только при разработке)
                     with st.expander("🔍 Отладочная информация", expanded=False):
                         st.write("**Рассчитанные индикаторы:**")
@@ -2467,7 +3064,7 @@ def main():
 
         **📊 Типы сигналов:**
         - 📈 **CALL** - цена пойдет вверх
-        - 📉 **PUT** - цена пойдет вниз  
+        - 📉 **PUT** - цена пойдет вниз
         - ⏳ **ЖДАТЬ** - неопределенность
 
         **⚠️ Важно:**
